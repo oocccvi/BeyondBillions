@@ -719,6 +719,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: dfd7f7c649e11ea4da6be1a1ec740f6f, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
+  showDebugGizmos: 0
   targetPosition: {x: 0, y: 0}
 --- !u!4 &1554732579
 Transform:
@@ -817,11 +818,11 @@ MonoBehaviour:
   currentWave: 0
   timeToNextWave: 30
   isWaveActive: 0
-  baseWaveCount: 20
-  countMultiplier: 1.2
+  zombiesPerPoint: 20
   maxSpawnPoints: 4
   zombieMesh: {fileID: 10202, guid: 0000000000000000e000000000000000, type: 0}
   zombieMaterial: {fileID: 2100000, guid: 4700c054c55bd2c43ad5f3f4fa6a563c, type: 2}
+  wandererMaterial: {fileID: 2100000, guid: 52b587dba9c5b894681a6ba049b89536, type: 2}
   zombieSpeed: 5
   zombieHealth: 100
 --- !u!4 &1953356357
@@ -1065,7 +1066,7 @@ MonoBehaviour:
   octaves: 2
   persistence: 0.3
   lacunarity: 3
-  seaLevel: 0.35
+  seaLevel: 0.25
   oceanMargin: 0
   islandSizeFactor: 0.8
   falloffPower: 1.5
@@ -1074,12 +1075,12 @@ MonoBehaviour:
   moistureScale: 30
   temperatureScale: 40
   deepWaterLevel: 0.2
-  waterLevel: 0.35
-  sandLevel: 0.4
-  forestLevel: 0.45
+  waterLevel: 0.27
+  sandLevel: 0.3
+  forestLevel: 0.4
   swampLevel: 0.7
-  mountainLevel: 0.85
-  snowLevel: 0.9
+  mountainLevel: 0.5
+  snowLevel: 0.8
   forestDensity: 0.4
   swampTreeDensity: 0.3
   swampProbability: 0.4

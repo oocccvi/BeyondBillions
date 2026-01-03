@@ -3,273 +3,399 @@ using Unity.Collections;
 using Unity.Mathematics;
 using Unity.Jobs;
 using Unity.Burst;
-using Unity.Entities;
-using System.Collections.Generic;
+using Unity.Entities; // [New] 需要引用 Entities 命名空间
 
 public class FlowFieldController : MonoBehaviour
 {
     public static FlowFieldController Instance { get; private set; }
 
-    // We use Allocator.Persistent so it survives between frames.
-    // However, to avoid race conditions with Systems reading the old array while we calculate a new one,
-    // we will calculate into a 'back buffer' or new array, and then swap.
-    public NativeArray<float2> FlowDirections;
-
+    [Header("Debug")]
+    public bool showDebugGizmos = false;
     public Vector2Int targetPosition;
-    private bool _hasTarget = false;
 
-    // [新增] 存储 HQ 的位置
-    private Vector2Int? _hqLocation = null;
-    public bool HasHQ => _hqLocation.HasValue;
+    // --- Data ---
+    public NativeArray<float2> FlowDirections;
+    public NativeArray<byte> CostField;
+    public NativeArray<ushort> IntegrationField;
 
-    private EntityManager _entityManager;
+    // [Fix] 添加 HasHQ 属性，满足 UnitSpawner 的调用需求
+    public bool HasHQ { get; private set; }
 
-    void Awake() { if (Instance != null && Instance != this) Destroy(this); Instance = this; }
-    void Start() { _entityManager = World.DefaultGameObjectInjectionWorld.EntityManager; _hasTarget = false; }
+    private int _width;
+    private int _height;
+    private bool _isInitialized = false;
+
+    void Awake()
+    {
+        if (Instance != null && Instance != this) Destroy(this);
+        Instance = this;
+    }
 
     void OnDestroy()
     {
-        // Must complete all jobs before disposing
-        // But since systems might be running, this is tricky. 
-        // Usually, OnDestroy happens when scene closes.
-        if (FlowDirections.IsCreated)
+        // [Critical Fix] 在释放 NativeArray 之前，必须确保所有可能正在读取它的 ECS Job 都已完成
+        // 否则会报 "InvalidOperationException: The previously scheduled job ... reads from the Unity.Collections.NativeArray"
+        if (World.DefaultGameObjectInjectionWorld != null)
         {
-            try { FlowDirections.Dispose(); } catch (System.Exception) { }
+            World.DefaultGameObjectInjectionWorld.EntityManager.CompleteAllTrackedJobs();
         }
-        if (Instance == this) Instance = null;
+
+        if (FlowDirections.IsCreated) FlowDirections.Dispose();
+        if (CostField.IsCreated) CostField.Dispose();
+        if (IntegrationField.IsCreated) IntegrationField.Dispose();
     }
 
-    // [新增] 注册 HQ 位置。BuildingManager 放置 HQ 后应该调用此方法。
+    public void Initialize(int width, int height)
+    {
+        _width = width;
+        _height = height;
+
+        if (FlowDirections.IsCreated) FlowDirections.Dispose();
+        if (CostField.IsCreated) CostField.Dispose();
+        if (IntegrationField.IsCreated) IntegrationField.Dispose();
+
+        FlowDirections = new NativeArray<float2>(_width * _height, Allocator.Persistent);
+        CostField = new NativeArray<byte>(_width * _height, Allocator.Persistent);
+        IntegrationField = new NativeArray<ushort>(_width * _height, Allocator.Persistent);
+
+        _isInitialized = true;
+    }
+
     public void RegisterHQ(int x, int y)
     {
-        _hqLocation = new Vector2Int(x, y);
-        Debug.Log($"[FlowField] HQ 已注册在 ({x}, {y})，流场目标已锁定至 HQ。");
-
-        // 强制立即更新目标为 HQ
+        // [Fix] 标记 HQ 已存在
+        HasHQ = true;
         UpdateTargetPosition(x, y);
     }
 
     public void UpdateTargetPosition(int x, int y)
     {
-        // [修改] 如果已经有 HQ 了，且传入的坐标不是 HQ 的坐标（比如是自动脚本设置的中心点），
-        // 我们忽略这次修改，强制保持 HQ 为目标。
-        if (_hqLocation.HasValue)
-        {
-            if (x != _hqLocation.Value.x || y != _hqLocation.Value.y)
-            {
-                // Debug.LogWarning($"[FlowField] 忽略目标 ({x},{y})，因为 HQ 存在于 ({_hqLocation.Value.x},{_hqLocation.Value.y})");
-                x = _hqLocation.Value.x;
-                y = _hqLocation.Value.y;
-            }
-        }
+        if (MapGenerator.Instance == null) return;
+        if (!_isInitialized) Initialize(MapGenerator.Instance.width, MapGenerator.Instance.height);
 
-        targetPosition = new Vector2Int(x, y);
-        _hasTarget = true;
+        // [Fix] 寻找最近的可行走点作为目标
+        // 防止 HQ 占用的格子被标记为障碍物，导致流场算法无法从中心开始扩散
+        targetPosition = FindNearestWalkable(x, y);
+
         CalculateFlowField();
     }
 
-    public Entity CreateLocalFlowField(List<Entity> soldiers, float3 targetPos)
+    // [New] 螺旋搜索最近的可行走点
+    private Vector2Int FindNearestWalkable(int startX, int startY)
+    {
+        var mapData = MapGenerator.Instance.MapData;
+        int w = _width;
+        int h = _height;
+
+        // 1. 检查原点是否可行走
+        if (IsWalkable(startX, startY, mapData, w, h))
+            return new Vector2Int(startX, startY);
+
+        // 2. 螺旋向外搜索 (最大半径10)
+        for (int r = 1; r <= 10; r++)
+        {
+            for (int i = -r; i <= r; i++)
+            {
+                // 检查这一圈的四个边
+                if (Check(startX + i, startY + r, mapData, w, h, out var p1)) return p1;
+                if (Check(startX + i, startY - r, mapData, w, h, out var p2)) return p2;
+                if (Check(startX + r, startY + i, mapData, w, h, out var p3)) return p3;
+                if (Check(startX - r, startY + i, mapData, w, h, out var p4)) return p4;
+            }
+        }
+
+        // 实在找不到，返回原点
+        return new Vector2Int(startX, startY);
+    }
+
+    private bool Check(int x, int y, NativeArray<MapGenerator.CellData> mapData, int w, int h, out Vector2Int result)
+    {
+        result = new Vector2Int(x, y);
+        return IsWalkable(x, y, mapData, w, h);
+    }
+
+    private bool IsWalkable(int x, int y, NativeArray<MapGenerator.CellData> mapData, int width, int height)
+    {
+        if (x < 0 || x >= width || y < 0 || y >= height) return false;
+        int idx = y * width + x;
+        byte t = mapData[idx].TerrainType;
+        // 0=DeepWater, 1=Water, 6=Mountain/Wall, 7=Snow, 9=Ruins
+        // 注意：如果 BuildingManager 把 HQ 下方的 TerrainType 改为了 6 (Wall)，这里就会返回 false
+        return !(t <= 1 || t == 6 || t == 7 || t == 9);
+    }
+
+    [ContextMenu("Force Recalculate")]
+    public void CalculateFlowField()
+    {
+        if (!_isInitialized || MapGenerator.Instance == null) return;
+
+        // [Safety Fix] 在重新计算前，也确保没有 Job 正在读取旧数据
+        // 这在运行时重新计算（如波次开始时）非常重要
+        if (World.DefaultGameObjectInjectionWorld != null)
+        {
+            World.DefaultGameObjectInjectionWorld.EntityManager.CompleteAllTrackedJobs();
+        }
+
+        // 1. 生成代价场 (Cost Field) - 这里包含了"防卡死"的核心逻辑
+        var costJob = new GenerateCostFieldJob
+        {
+            MapData = MapGenerator.Instance.MapData,
+            CostField = CostField,
+            Width = _width,
+            Height = _height,
+            WallBufferCost = 20, // 墙壁缓冲区的代价 (越高越排斥墙壁)
+            BaseCost = 1
+        };
+        JobHandle costHandle = costJob.Schedule(_width * _height, 64);
+
+        // 2. 生成积分场 (Integration Field) - Dijkstra 算法
+        var integrationJob = new CalculateIntegrationFieldJob
+        {
+            CostField = CostField,
+            IntegrationField = IntegrationField,
+            Width = _width,
+            Height = _height,
+            TargetIndex = targetPosition.y * _width + targetPosition.x
+        };
+        // Dijkstra 很难并行化，所以我们在单线程 Job 中运行 (或使用 Wavefront 算法)
+        JobHandle integrationHandle = integrationJob.Schedule(costHandle);
+
+        // 3. 生成流场向量 (Flow Directions)
+        var flowJob = new GenerateFlowDirectionsJob
+        {
+            IntegrationField = IntegrationField,
+            FlowDirections = FlowDirections,
+            Width = _width,
+            Height = _height
+        };
+        JobHandle flowHandle = flowJob.Schedule(_width * _height, 64, integrationHandle);
+
+        flowHandle.Complete();
+    }
+
+    // --- 辅助功能：为小队生成局部流场 (如攻击移动) ---
+    public Entity CreateLocalFlowField(System.Collections.Generic.List<Entity> units, float3 target)
     {
         return Entity.Null;
     }
 
-    [ContextMenu("Recalculate Flow Field")]
-    public void CalculateFlowField()
+    // --- Jobs ---
+
+    [BurstCompile]
+    struct GenerateCostFieldJob : IJobParallelFor
     {
-        if (MapGenerator.Instance == null || !MapGenerator.Instance.IsInitialized) return;
+        [ReadOnly] public NativeArray<MapGenerator.CellData> MapData;
+        [WriteOnly] public NativeArray<byte> CostField;
+        public int Width;
+        public int Height;
+        public byte WallBufferCost;
+        public byte BaseCost;
 
-        // [修改] 如果有 HQ，确保目标始终指向 HQ
-        if (_hqLocation.HasValue)
+        public void Execute(int index)
         {
-            targetPosition = _hqLocation.Value;
-            _hasTarget = true;
-        }
+            byte terrainType = MapData[index].TerrainType;
 
-        if (!_hasTarget) return;
+            // 阻挡判断: 0(DeepWater), 1(Water), 6(Mountain), 7(Snow), 9(Ruins)
+            bool isObstacle = (terrainType <= 1 || terrainType == 6 || terrainType == 7 || terrainType == 9);
 
-        int width = MapGenerator.Instance.width;
-        int height = MapGenerator.Instance.height;
-        int len = width * height;
-        var mapData = MapGenerator.Instance.MapData;
-
-        // Create a NEW array for the result to avoid conflict with running jobs reading the OLD FlowDirections
-        NativeArray<float2> newFlowDirections = new NativeArray<float2>(len, Allocator.Persistent);
-
-        var offsets = new NativeArray<int2>(8, Allocator.TempJob);
-        offsets[0] = new int2(0, 1); offsets[1] = new int2(0, -1); offsets[2] = new int2(-1, 0); offsets[3] = new int2(1, 0);
-        offsets[4] = new int2(-1, 1); offsets[5] = new int2(1, 1); offsets[6] = new int2(-1, -1); offsets[7] = new int2(1, -1);
-
-        var costs = new NativeArray<int>(8, Allocator.TempJob);
-        for (int i = 0; i < 4; i++) costs[i] = 10; for (int i = 4; i < 8; i++) costs[i] = 14;
-
-        var job = new CalculateFlowFieldJob
-        {
-            width = width,
-            height = height,
-            targetX = targetPosition.x,
-            targetY = targetPosition.y,
-            mapData = mapData,
-            flowDirections = newFlowDirections, // Write to new array
-            NeighborOffsets = offsets,
-            NeighborCosts = costs
-        };
-
-        // Run immediately on main thread
-        job.Run();
-
-        offsets.Dispose();
-        costs.Dispose();
-
-        // Now swap the arrays safely
-        if (FlowDirections.IsCreated)
-        {
-            var old = FlowDirections;
-            FlowDirections = newFlowDirections;
-
-            // 尝试释放旧数组。如果还有 Job 在使用它，这里会抛出异常。
-            // 我们捕获异常以防止游戏崩溃。
-            // 虽然这可能导致内存泄漏（那块内存没被释放），但在这个阶段比崩溃要好。
-            // 理想的做法是使用 JobHandle 链来管理依赖，但在 MonoBehaviour 中这很困难。
-            try
+            if (isObstacle)
             {
-                old.Dispose();
+                CostField[index] = 255; // 不可通行
             }
-            catch (System.Exception)
+            else
             {
-                // Job 还在运行，无法释放。
-                // 这次泄漏是可以接受的代价，或者我们可以把 old 加入一个全局列表，在 LateUpdate 尝试释放。
-                // Debug.LogWarning("FlowFieldController: 无法释放旧流场数组，可能有 Job 正在读取。");
+                // [核心优化] 检查 8 邻居是否有障碍物
+                // 如果旁边有墙，增加代价，形成 "软阻挡"
+                bool nearWall = false;
+                int x = index % Width;
+                int y = index / Width;
+
+                for (int dy = -1; dy <= 1; dy++)
+                {
+                    for (int dx = -1; dx <= 1; dx++)
+                    {
+                        if (dx == 0 && dy == 0) continue;
+                        int nx = x + dx;
+                        int ny = y + dy;
+
+                        if (nx >= 0 && nx < Width && ny >= 0 && ny < Height)
+                        {
+                            int nIdx = ny * Width + nx;
+                            byte nType = MapData[nIdx].TerrainType;
+                            if (nType <= 1 || nType == 6 || nType == 7 || nType == 9)
+                            {
+                                nearWall = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (nearWall) break;
+                }
+
+                if (nearWall)
+                {
+                    CostField[index] = WallBufferCost; // 靠近墙壁，代价高
+                }
+                else
+                {
+                    // 道路 (Terrain 8) 依然可以有更低代价
+                    if (terrainType == 8) CostField[index] = 1;
+                    else CostField[index] = BaseCost;
+                }
             }
-        }
-        else
-        {
-            FlowDirections = newFlowDirections;
         }
     }
 
     [BurstCompile]
-    struct CalculateFlowFieldJob : IJob
+    struct CalculateIntegrationFieldJob : IJob
     {
-        public int width; public int height; public int targetX; public int targetY;
-        [ReadOnly] public NativeArray<MapGenerator.CellData> mapData;
-        [WriteOnly] public NativeArray<float2> flowDirections;
-        [ReadOnly] public NativeArray<int2> NeighborOffsets;
-        [ReadOnly] public NativeArray<int> NeighborCosts;
+        [ReadOnly] public NativeArray<byte> CostField;
+        public NativeArray<ushort> IntegrationField;
+        public int Width;
+        public int Height;
+        public int TargetIndex;
 
         public void Execute()
         {
-            int len = width * height;
-            int targetIdx = targetY * width + targetX;
-
-            var costField = new NativeArray<byte>(len, Allocator.Temp);
-            var integrationField = new NativeArray<int>(len, Allocator.Temp);
-            var queue = new NativeQueue<int>(Allocator.Temp);
-
-            for (int i = 0; i < len; i++)
+            for (int i = 0; i < IntegrationField.Length; i++)
             {
-                integrationField[i] = int.MaxValue;
-                byte type = mapData[i].TerrainType;
-
-                if (type == 8) costField[i] = 1;       // Road
-                else if (type == 4) costField[i] = 6;  // Forest
-                else if (type == 5) costField[i] = 8;  // Swamp
-                else if (type <= 1 || type == 6 || type == 7 || type == 9)
-                {
-                    costField[i] = 10;
-                }
-                else
-                {
-                    costField[i] = 5;
-                }
+                IntegrationField[i] = ushort.MaxValue;
             }
 
-            int clearRadius = 2;
-            for (int x = targetX - clearRadius; x <= targetX + clearRadius; x++)
+            NativeList<int> openList = new NativeList<int>(Allocator.Temp);
+            NativeList<int> nextList = new NativeList<int>(Allocator.Temp);
+
+            IntegrationField[TargetIndex] = 0;
+            openList.Add(TargetIndex);
+
+            while (openList.Length > 0)
             {
-                for (int y = targetY - clearRadius; y <= targetY + clearRadius; y++)
+                for (int i = 0; i < openList.Length; i++)
                 {
-                    if (x >= 0 && x < width && y >= 0 && y < height)
-                    {
-                        int idx = y * width + x;
-                        costField[idx] = 1;
-                    }
+                    int idx = openList[i];
+                    ushort currentCost = IntegrationField[idx];
+                    int cx = idx % Width;
+                    int cy = idx / Width;
+
+                    CheckNeighbor(idx, cx, cy + 1, currentCost, ref nextList);
+                    CheckNeighbor(idx, cx, cy - 1, currentCost, ref nextList);
+                    CheckNeighbor(idx, cx - 1, cy, currentCost, ref nextList);
+                    CheckNeighbor(idx, cx + 1, cy, currentCost, ref nextList);
                 }
+
+                openList.Clear();
+                var temp = openList;
+                openList = nextList;
+                nextList = temp;
             }
 
-            integrationField[targetIdx] = 0;
-            queue.Enqueue(targetIdx);
+            openList.Dispose();
+            nextList.Dispose();
+        }
 
-            int4 offsets = new int4(-1, 1, -width, width);
-
-            while (!queue.IsEmpty())
+        private void CheckNeighbor(int currentIdx, int nx, int ny, ushort currentIntCost, ref NativeList<int> nextList)
+        {
+            if (nx >= 0 && nx < Width && ny >= 0 && ny < Height)
             {
-                int currentIdx = queue.Dequeue();
-                int currentCost = integrationField[currentIdx];
-                int cx = currentIdx % width;
+                int nIdx = ny * Width + nx;
+                byte moveCost = CostField[nIdx];
 
-                for (int i = 0; i < 4; i++)
+                if (moveCost == 255) return;
+
+                int newCost = currentIntCost + moveCost;
+                if (newCost < IntegrationField[nIdx])
                 {
-                    int neighborIdx = currentIdx + offsets[i];
-                    if (neighborIdx < 0 || neighborIdx >= len) continue;
-                    if (i == 0 && cx == 0) continue;
-                    if (i == 1 && cx == width - 1) continue;
-
-                    byte cost = costField[neighborIdx];
-                    if (cost == 255) continue;
-
-                    int newCost = currentCost + cost;
-                    if (newCost < integrationField[neighborIdx])
-                    {
-                        integrationField[neighborIdx] = newCost;
-                        queue.Enqueue(neighborIdx);
-                    }
+                    IntegrationField[nIdx] = (ushort)newCost;
+                    nextList.Add(nIdx);
                 }
             }
-
-            for (int idx = 0; idx < len; idx++)
-            {
-                // Safety check
-                if (idx < 0 || idx >= flowDirections.Length) continue;
-
-                if (costField[idx] == 255 || idx == targetIdx)
-                {
-                    flowDirections[idx] = float2.zero;
-                    continue;
-                }
-
-                int bestCost = integrationField[idx];
-                int cx = idx % width;
-                int cy = idx / width;
-                int2 bestDir = int2.zero;
-
-                for (int i = 0; i < 8; i++)
-                {
-                    int2 offset = NeighborOffsets[i];
-                    int nx = cx + offset.x;
-                    int ny = cy + offset.y;
-                    if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
-                    int neighborIdx = ny * width + nx;
-
-                    int neighborTotalCost = integrationField[neighborIdx];
-
-                    if (neighborTotalCost < bestCost)
-                    {
-                        bestCost = neighborTotalCost;
-                        bestDir = offset;
-                    }
-                }
-
-                if (bestDir.x != 0 || bestDir.y != 0)
-                    flowDirections[idx] = math.normalizesafe(new float2(bestDir.x, bestDir.y));
-                else
-                    flowDirections[idx] = float2.zero;
-            }
-
-            costField.Dispose();
-            integrationField.Dispose();
-            queue.Dispose();
         }
     }
 
-    public bool IsValidTarget(int x, int y, int width, int height, NativeArray<MapGenerator.CellData> mapData) { return true; }
+    [BurstCompile]
+    struct GenerateFlowDirectionsJob : IJobParallelFor
+    {
+        [ReadOnly] public NativeArray<ushort> IntegrationField;
+        [WriteOnly] public NativeArray<float2> FlowDirections;
+        public int Width;
+        public int Height;
+
+        public void Execute(int index)
+        {
+            ushort myCost = IntegrationField[index];
+            if (myCost == ushort.MaxValue)
+            {
+                FlowDirections[index] = float2.zero;
+                return;
+            }
+
+            int x = index % Width;
+            int y = index / Width;
+
+            int bestIdx = -1;
+            ushort bestCost = myCost;
+
+            for (int dy = -1; dy <= 1; dy++)
+            {
+                for (int dx = -1; dx <= 1; dx++)
+                {
+                    if (dx == 0 && dy == 0) continue;
+                    int nx = x + dx;
+                    int ny = y + dy;
+
+                    if (nx >= 0 && nx < Width && ny >= 0 && ny < Height)
+                    {
+                        int nIdx = ny * Width + nx;
+                        ushort nCost = IntegrationField[nIdx];
+                        if (nCost < bestCost)
+                        {
+                            bestCost = nCost;
+                            bestIdx = nIdx;
+                        }
+                    }
+                }
+            }
+
+            if (bestIdx != -1)
+            {
+                int bx = bestIdx % Width;
+                int by = bestIdx / Width;
+                float2 dir = new float2(bx - x, by - y);
+                FlowDirections[index] = math.normalizesafe(dir);
+            }
+            else
+            {
+                FlowDirections[index] = float2.zero;
+            }
+        }
+    }
+
+    void OnDrawGizmos()
+    {
+        if (!showDebugGizmos || !_isInitialized || !FlowDirections.IsCreated) return;
+
+        Vector3 camPos = Camera.main ? Camera.main.transform.position : Vector3.zero;
+        int range = 20;
+        int cx = (int)camPos.x;
+        int cz = (int)camPos.z;
+
+        Gizmos.color = Color.yellow;
+        for (int y = cz - range; y <= cz + range; y++)
+        {
+            for (int x = cx - range; x <= cx + range; x++)
+            {
+                if (x >= 0 && x < _width && y >= 0 && y < _height)
+                {
+                    int i = y * _width + x;
+                    float2 dir = FlowDirections[i];
+                    if (math.lengthsq(dir) > 0.1f)
+                    {
+                        Vector3 start = new Vector3(x, 1, y);
+                        Vector3 end = start + new Vector3(dir.x, 0, dir.y) * 0.4f;
+                        Gizmos.DrawLine(start, end);
+                    }
+                }
+            }
+        }
+    }
 }

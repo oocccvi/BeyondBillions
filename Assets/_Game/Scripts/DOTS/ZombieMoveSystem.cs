@@ -86,13 +86,12 @@ public partial struct ZombieMoveJob : IJobEntity
         {
             int index = z * Width + x;
 
-            // [修改] 地形减速逻辑
+            // 地形减速逻辑
             float terrainModifier = 1.0f;
             byte type = MapData[index].TerrainType;
 
-            // 保留一点特性：道路加速，但其他阻挡地形不再阻止移动
-            if (type == 8) terrainModifier = 1.3f;
-            else if (type == 4) terrainModifier = 0.8f;
+            if (type == 8) terrainModifier = 1.3f; // 道路加速
+            else if (type == 4) terrainModifier = 0.8f; // 森林减速
 
             float actualSpeed = speed.Value * terrainModifier;
 
@@ -177,39 +176,50 @@ public partial struct ZombieMoveJob : IJobEntity
                 finalDir = float2.zero;
             }
 
-            // --- 5. 移动 ---
+            // --- 5. 移动 (带碰撞检测) ---
             if (math.lengthsq(finalDir) > 0.001f)
             {
                 float moveDist = actualSpeed * DeltaTime;
                 float3 currentPos = transform.Position;
 
+                // 尝试 X 轴移动
                 float nextX = currentPos.x + finalDir.x * moveDist;
-                // [修改] 直接移动，不再判断 IsWalkable，或者 IsWalkable 永远返回 true
                 if (IsWalkable(nextX, currentPos.z))
                 {
                     transform.Position.x = nextX;
                 }
 
+                // 尝试 Z 轴移动
                 float nextZ = currentPos.z + finalDir.y * moveDist;
                 if (IsWalkable(transform.Position.x, nextZ))
                 {
                     transform.Position.z = nextZ;
                 }
 
+                // 旋转
                 float angle = math.atan2(finalDir.x, finalDir.y);
                 transform.Rotation = math.slerp(transform.Rotation, quaternion.RotateY(angle), DeltaTime * 10f);
             }
         }
     }
 
-    // [核心修改] 永远返回 true，任何地形都可通行
+    // [核心修复] 根据 MapData 检查地形阻挡
     private bool IsWalkable(float x, float z)
     {
         int ix = (int)math.floor(x);
         int iz = (int)math.floor(z);
 
+        // 边界检查
         if (ix < 0 || ix >= Width || iz < 0 || iz >= Height) return false;
 
-        return true; // 移除所有阻挡判断
+        int index = iz * Width + ix;
+        byte t = MapData[index].TerrainType;
+
+        // 阻挡地形检查
+        // 0(DeepWater), 1(Water), 6(Mountain/Wall), 7(Snow), 9(Ruins)
+        // 注意：建造的墙壁通常会设置 TerrainType 为 6
+        if (t <= 1 || t == 6 || t == 7 || t == 9) return false;
+
+        return true;
     }
 }
