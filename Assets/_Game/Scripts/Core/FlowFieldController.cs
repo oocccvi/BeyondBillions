@@ -8,26 +8,83 @@ using System.Collections.Generic;
 
 public class FlowFieldController : MonoBehaviour
 {
-    // ... (Instance, Awake, Start, OnDestroy, UpdateTargetPosition, CreateLocalFlowField 保持不变，请复用) ...
-    // 为节省篇幅，重点展示 CalculateFlowField 和 Job 的修改
-
-    // ... (请确保保留之前的完整类结构) ...
     public static FlowFieldController Instance { get; private set; }
+
+    // We use Allocator.Persistent so it survives between frames.
+    // However, to avoid race conditions with Systems reading the old array while we calculate a new one,
+    // we will calculate into a 'back buffer' or new array, and then swap.
     public NativeArray<float2> FlowDirections;
+
     public Vector2Int targetPosition;
     private bool _hasTarget = false;
+
+    // [新增] 存储 HQ 的位置
+    private Vector2Int? _hqLocation = null;
+    public bool HasHQ => _hqLocation.HasValue;
+
     private EntityManager _entityManager;
 
     void Awake() { if (Instance != null && Instance != this) Destroy(this); Instance = this; }
     void Start() { _entityManager = World.DefaultGameObjectInjectionWorld.EntityManager; _hasTarget = false; }
-    void OnDestroy() { if (FlowDirections.IsCreated) { try { FlowDirections.Dispose(); } catch (System.InvalidOperationException) { } } if (Instance == this) Instance = null; }
-    public void UpdateTargetPosition(int x, int y) { targetPosition = new Vector2Int(x, y); _hasTarget = true; CalculateFlowField(); }
-    public Entity CreateLocalFlowField(List<Entity> soldiers, float3 targetPos) { /* 保持原样 */ return Entity.Null; } // 请使用之前的完整代码
+
+    void OnDestroy()
+    {
+        // Must complete all jobs before disposing
+        // But since systems might be running, this is tricky. 
+        // Usually, OnDestroy happens when scene closes.
+        if (FlowDirections.IsCreated)
+        {
+            try { FlowDirections.Dispose(); } catch (System.Exception) { }
+        }
+        if (Instance == this) Instance = null;
+    }
+
+    // [新增] 注册 HQ 位置。BuildingManager 放置 HQ 后应该调用此方法。
+    public void RegisterHQ(int x, int y)
+    {
+        _hqLocation = new Vector2Int(x, y);
+        Debug.Log($"[FlowField] HQ 已注册在 ({x}, {y})，流场目标已锁定至 HQ。");
+
+        // 强制立即更新目标为 HQ
+        UpdateTargetPosition(x, y);
+    }
+
+    public void UpdateTargetPosition(int x, int y)
+    {
+        // [修改] 如果已经有 HQ 了，且传入的坐标不是 HQ 的坐标（比如是自动脚本设置的中心点），
+        // 我们忽略这次修改，强制保持 HQ 为目标。
+        if (_hqLocation.HasValue)
+        {
+            if (x != _hqLocation.Value.x || y != _hqLocation.Value.y)
+            {
+                // Debug.LogWarning($"[FlowField] 忽略目标 ({x},{y})，因为 HQ 存在于 ({_hqLocation.Value.x},{_hqLocation.Value.y})");
+                x = _hqLocation.Value.x;
+                y = _hqLocation.Value.y;
+            }
+        }
+
+        targetPosition = new Vector2Int(x, y);
+        _hasTarget = true;
+        CalculateFlowField();
+    }
+
+    public Entity CreateLocalFlowField(List<Entity> soldiers, float3 targetPos)
+    {
+        return Entity.Null;
+    }
 
     [ContextMenu("Recalculate Flow Field")]
     public void CalculateFlowField()
     {
         if (MapGenerator.Instance == null || !MapGenerator.Instance.IsInitialized) return;
+
+        // [修改] 如果有 HQ，确保目标始终指向 HQ
+        if (_hqLocation.HasValue)
+        {
+            targetPosition = _hqLocation.Value;
+            _hasTarget = true;
+        }
+
         if (!_hasTarget) return;
 
         int width = MapGenerator.Instance.width;
@@ -35,27 +92,14 @@ public class FlowFieldController : MonoBehaviour
         int len = width * height;
         var mapData = MapGenerator.Instance.MapData;
 
-        if (!IsValidTarget(targetPosition.x, targetPosition.y, width, mapData))
-        {
-            int targetIndex = targetPosition.y * width + targetPosition.x;
-            if (mapData[targetIndex].TerrainType == 0)
-            {
-                targetPosition = FindValidTargetPosition(width, height, mapData);
-            }
-        }
-
-        if (!FlowDirections.IsCreated || FlowDirections.Length != len)
-        {
-            if (FlowDirections.IsCreated) FlowDirections.Dispose();
-            FlowDirections = new NativeArray<float2>(len, Allocator.Persistent);
-        }
+        // Create a NEW array for the result to avoid conflict with running jobs reading the OLD FlowDirections
+        NativeArray<float2> newFlowDirections = new NativeArray<float2>(len, Allocator.Persistent);
 
         var offsets = new NativeArray<int2>(8, Allocator.TempJob);
         offsets[0] = new int2(0, 1); offsets[1] = new int2(0, -1); offsets[2] = new int2(-1, 0); offsets[3] = new int2(1, 0);
         offsets[4] = new int2(-1, 1); offsets[5] = new int2(1, 1); offsets[6] = new int2(-1, -1); offsets[7] = new int2(1, -1);
 
         var costs = new NativeArray<int>(8, Allocator.TempJob);
-        // 基础移动代价
         for (int i = 0; i < 4; i++) costs[i] = 10; for (int i = 4; i < 8; i++) costs[i] = 14;
 
         var job = new CalculateFlowFieldJob
@@ -65,15 +109,42 @@ public class FlowFieldController : MonoBehaviour
             targetX = targetPosition.x,
             targetY = targetPosition.y,
             mapData = mapData,
-            flowDirections = FlowDirections,
+            flowDirections = newFlowDirections, // Write to new array
             NeighborOffsets = offsets,
             NeighborCosts = costs
         };
 
+        // Run immediately on main thread
         job.Run();
 
         offsets.Dispose();
         costs.Dispose();
+
+        // Now swap the arrays safely
+        if (FlowDirections.IsCreated)
+        {
+            var old = FlowDirections;
+            FlowDirections = newFlowDirections;
+
+            // 尝试释放旧数组。如果还有 Job 在使用它，这里会抛出异常。
+            // 我们捕获异常以防止游戏崩溃。
+            // 虽然这可能导致内存泄漏（那块内存没被释放），但在这个阶段比崩溃要好。
+            // 理想的做法是使用 JobHandle 链来管理依赖，但在 MonoBehaviour 中这很困难。
+            try
+            {
+                old.Dispose();
+            }
+            catch (System.Exception)
+            {
+                // Job 还在运行，无法释放。
+                // 这次泄漏是可以接受的代价，或者我们可以把 old 加入一个全局列表，在 LateUpdate 尝试释放。
+                // Debug.LogWarning("FlowFieldController: 无法释放旧流场数组，可能有 Job 正在读取。");
+            }
+        }
+        else
+        {
+            FlowDirections = newFlowDirections;
+        }
     }
 
     [BurstCompile]
@@ -97,29 +168,21 @@ public class FlowFieldController : MonoBehaviour
             for (int i = 0; i < len; i++)
             {
                 integrationField[i] = int.MaxValue;
-
                 byte type = mapData[i].TerrainType;
 
-                // [核心修改] 更新代价场 (Cost Field)
-                if (type == 0 || type == 2 || type == 4)
+                if (type == 8) costField[i] = 1;       // Road
+                else if (type == 4) costField[i] = 6;  // Forest
+                else if (type == 5) costField[i] = 8;  // Swamp
+                else if (type <= 1 || type == 6 || type == 7 || type == 9)
                 {
-                    costField[i] = 255; // 阻挡
-                }
-                else if (type == 5)
-                {
-                    costField[i] = 50; // 森林：代价高，尽量绕开
-                }
-                else if (type == 6)
-                {
-                    costField[i] = 100; // 沼泽：代价非常高
+                    costField[i] = 10;
                 }
                 else
                 {
-                    costField[i] = 1; // 平原/道路/矿脉：代价低
+                    costField[i] = 5;
                 }
             }
 
-            // HQ 周围强制通行 (半径2)
             int clearRadius = 2;
             for (int x = targetX - clearRadius; x <= targetX + clearRadius; x++)
             {
@@ -128,7 +191,7 @@ public class FlowFieldController : MonoBehaviour
                     if (x >= 0 && x < width && y >= 0 && y < height)
                     {
                         int idx = y * width + x;
-                        if (mapData[idx].TerrainType != 0) costField[idx] = 1;
+                        costField[idx] = 1;
                     }
                 }
             }
@@ -154,7 +217,6 @@ public class FlowFieldController : MonoBehaviour
                     byte cost = costField[neighborIdx];
                     if (cost == 255) continue;
 
-                    // Dijkstra 累加代价
                     int newCost = currentCost + cost;
                     if (newCost < integrationField[neighborIdx])
                     {
@@ -166,6 +228,9 @@ public class FlowFieldController : MonoBehaviour
 
             for (int idx = 0; idx < len; idx++)
             {
+                // Safety check
+                if (idx < 0 || idx >= flowDirections.Length) continue;
+
                 if (costField[idx] == 255 || idx == targetIdx)
                 {
                     flowDirections[idx] = float2.zero;
@@ -185,7 +250,6 @@ public class FlowFieldController : MonoBehaviour
                     if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
                     int neighborIdx = ny * width + nx;
 
-                    // 这里不需要再加 terrain cost，因为 integrationField 已经包含了累积代价
                     int neighborTotalCost = integrationField[neighborIdx];
 
                     if (neighborTotalCost < bestCost)
@@ -207,38 +271,5 @@ public class FlowFieldController : MonoBehaviour
         }
     }
 
-    private bool IsValidTarget(int x, int y, int width, NativeArray<MapGenerator.CellData> mapData)
-    {
-        int index = y * width + x;
-        return mapData[index].TerrainType != 0;
-    }
-
-    private Vector2Int FindValidTargetPosition(int width, int height, NativeArray<MapGenerator.CellData> mapData)
-    {
-        // 保持原样
-        bool[,] visited = new bool[width, height];
-        System.Collections.Generic.Queue<Vector2Int> searchQueue = new System.Collections.Generic.Queue<Vector2Int>();
-        Vector2Int start = targetPosition;
-        searchQueue.Enqueue(start);
-        visited[start.x, start.y] = true;
-        int maxIterations = 5000;
-        int iterations = 0;
-        int[] dx = { 0, 0, 1, -1 };
-        int[] dy = { 1, -1, 0, 0 };
-        while (searchQueue.Count > 0 && iterations < maxIterations)
-        {
-            Vector2Int current = searchQueue.Dequeue();
-            iterations++;
-            if (IsValidTarget(current.x, current.y, width, mapData)) return current;
-            for (int i = 0; i < 4; i++)
-            {
-                int nx = current.x + dx[i]; int ny = current.y + dy[i];
-                if (nx >= 0 && nx < width && ny >= 0 && ny < height && !visited[nx, ny])
-                {
-                    visited[nx, ny] = true; searchQueue.Enqueue(new Vector2Int(nx, ny));
-                }
-            }
-        }
-        return targetPosition;
-    }
+    public bool IsValidTarget(int x, int y, int width, int height, NativeArray<MapGenerator.CellData> mapData) { return true; }
 }

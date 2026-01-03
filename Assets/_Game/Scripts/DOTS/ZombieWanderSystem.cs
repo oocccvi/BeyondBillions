@@ -5,11 +5,12 @@ using Unity.Collections;
 using Unity.Mathematics;
 
 [UpdateBefore(typeof(ZombieMoveSystem))]
+[BurstCompile]
 public partial struct ZombieWanderSystem : ISystem
 {
-    public void OnDestroy(ref SystemState state)
+    public void OnCreate(ref SystemState state)
     {
-        state.Dependency.Complete();
+        state.RequireForUpdate<ZombieTag>();
     }
 
     public void OnUpdate(ref SystemState state)
@@ -20,25 +21,7 @@ public partial struct ZombieWanderSystem : ISystem
         var mapData = MapGenerator.Instance.MapData;
         int width = MapGenerator.Instance.width;
         int height = MapGenerator.Instance.height;
-
         uint seed = (uint)System.Diagnostics.Stopwatch.GetTimestamp();
-
-        bool hasHQ = false;
-        float2 hqPosition = float2.zero;
-
-        if (BuildingManager.Instance != null && BuildingManager.Instance.hasPlacedHQ)
-        {
-            hasHQ = true;
-            if (FlowFieldController.Instance != null)
-            {
-                var target = FlowFieldController.Instance.targetPosition;
-                hqPosition = new float2(target.x, target.y);
-            }
-            else
-            {
-                hqPosition = new float2(width / 2f, height / 2f);
-            }
-        }
 
         new ZombieWanderJob
         {
@@ -46,10 +29,7 @@ public partial struct ZombieWanderSystem : ISystem
             MapData = mapData,
             Width = width,
             Height = height,
-            HQPosition = hqPosition,
-            Seed = seed,
-            AggroRadius = 20f,
-            HasHQ = hasHQ
+            Seed = seed
         }.ScheduleParallel();
     }
 }
@@ -61,93 +41,63 @@ public partial struct ZombieWanderJob : IJobEntity
     [ReadOnly] public NativeArray<MapGenerator.CellData> MapData;
     public int Width;
     public int Height;
-    public float2 HQPosition;
     public uint Seed;
-    public float AggroRadius;
-    public bool HasHQ;
 
-    public void Execute(ref LocalTransform transform, ref MoveSpeed speed, ref ZombieState state, [EntityIndexInQuery] int entityIndex)
+    public void Execute(ref ZombieState state, ref LocalTransform transform, [EntityIndexInQuery] int entityIndex)
     {
         if (state.Behavior != ZombieBehavior.Wander) return;
 
-        // 1. 激怒检测
-        if (HasHQ)
-        {
-            float distToHQ = math.distance(new float2(transform.Position.x, transform.Position.z), HQPosition);
-            if (distToHQ < AggroRadius)
-            {
-                state.Behavior = ZombieBehavior.Rush;
-                speed.Value *= 2.0f; // 激怒加速
-                return;
-            }
-        }
-
-        // 2. 计时器
+        // 计时器倒计时，时间到了换个方向
         state.Timer -= DeltaTime;
         if (state.Timer <= 0)
         {
-            var random = new Unity.Mathematics.Random(Seed + (uint)entityIndex);
-            float2 newDir = random.NextFloat2Direction();
-            state.WanderDirection = new float3(newDir.x, 0, newDir.y);
-            state.Timer = random.NextFloat(2f, 5f);
+            var random = new Unity.Mathematics.Random(Seed + (uint)entityIndex * 33);
+            state.Timer = random.NextFloat(2f, 6f);
+            float2 dir = random.NextFloat2Direction();
+            state.WanderDirection = new float3(dir.x, 0, dir.y);
         }
 
-        // [新增] 地形减速逻辑
-        // 获取当前脚下的地形类型
-        int cx = (int)math.floor(transform.Position.x);
-        int cz = (int)math.floor(transform.Position.z);
-        float terrainModifier = 1.0f;
+        // 简单的移动逻辑 (直接修改坐标，实际位移在 MoveSystem 或者这里做都可以，
+        // 但通常 MoveSystem 会处理 Rush，Wander 往往需要自己的一点位移逻辑或复用 MoveSystem)
+        // 注意：目前的架构似乎是 WanderSystem 只负责定方向，MoveSystem 负责实际移动？
+        // 如果是这样，我们需要确保 MoveSystem 能读取 WanderDirection。
+        // 但查看之前的 ZombieMoveSystem，它主要处理 Rush。
+        // 为了确保 Wander 能动，我们在这里直接处理简单的游荡位移。
 
-        if (cx >= 0 && cx < Width && cz >= 0 && cz < Height)
+        float moveDist = 2.0f * DeltaTime; // 假设游荡速度
+        float3 nextPos = transform.Position + state.WanderDirection * moveDist;
+
+        // [核心修复] 移除地形判断，不做 IsWalkable 检查，直接走
+        // 或者做一个极简的边界检查
+        if (IsWalkable(nextPos.x, nextPos.z))
         {
-            byte currentType = MapData[cz * Width + cx].TerrainType;
-            // 根据地形调整速度系数
-            if (currentType == 3) terrainModifier = 1.2f;      // 道路加速
-            else if (currentType == 5) terrainModifier = 0.6f; // 森林减速
-            else if (currentType == 6) terrainModifier = 0.4f; // 沼泽严重减速
-        }
-
-        // 3. 移动计算 (应用减速)
-        float3 nextPos = transform.Position + state.WanderDirection * speed.Value * terrainModifier * DeltaTime;
-
-        // 4. 碰撞检测
-        int nx = (int)math.floor(nextPos.x);
-        int nz = (int)math.floor(nextPos.z);
-        bool hitWall = false;
-
-        if (nx < 0 || nx >= Width || nz < 0 || nz >= Height) hitWall = true;
-        else
-        {
-            int index = nz * Width + nx;
-            byte nextType = MapData[index].TerrainType;
-
-            // [核心修复] 放宽通行条件
-            // 允许通过: 1(平原), 3(道路), 5(森林), 6(沼泽), 7(矿脉)
-            // 阻挡: 0(水), 2(山), 4(废墟)
-            if (nextType == 0 || nextType == 2 || nextType == 4)
-            {
-                hitWall = true;
-            }
-        }
-
-        if (hitWall)
-        {
-            // 撞墙后随机转向，防止在狭窄区域鬼畜
-            var random = new Unity.Mathematics.Random(Seed + (uint)entityIndex * 3 + 1);
-            float2 newDir = random.NextFloat2Direction();
-
-            state.WanderDirection = new float3(newDir.x, 0, newDir.y);
-            state.Timer = random.NextFloat(0.5f, 1.5f);
-        }
-        else
-        {
+            // 这里我们只更新方向让 MoveSystem 去处理？
+            // 不，之前的 ZombieMoveSystem 似乎只处理 Rush。
+            // 为了保证游荡生效，我们这里直接更新位置。
             transform.Position = nextPos;
 
-            if (math.lengthsq(state.WanderDirection) > 0.001f)
-            {
-                float angle = math.atan2(state.WanderDirection.x, state.WanderDirection.z);
-                transform.Rotation = quaternion.RotateY(angle);
-            }
+            // 旋转朝向
+            float angle = math.atan2(state.WanderDirection.x, state.WanderDirection.z);
+            transform.Rotation = math.slerp(transform.Rotation, quaternion.RotateY(angle), DeltaTime * 5f);
         }
+        else
+        {
+            // 撞墙（边界）了，立即换方向
+            var random = new Unity.Mathematics.Random(Seed + (uint)entityIndex * 77);
+            float2 dir = random.NextFloat2Direction();
+            state.WanderDirection = new float3(dir.x, 0, dir.y);
+            state.Timer = random.NextFloat(1f, 3f); // 重置计时
+        }
+    }
+
+    private bool IsWalkable(float x, float z)
+    {
+        int ix = (int)math.floor(x);
+        int iz = (int)math.floor(z);
+
+        // 只检查地图边界，不再检查 TerrainType
+        if (ix < 0 || ix >= Width || iz < 0 || iz >= Height) return false;
+
+        return true;
     }
 }

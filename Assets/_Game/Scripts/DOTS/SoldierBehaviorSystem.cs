@@ -50,23 +50,19 @@ public partial struct SoldierBrainJob : IJobEntity
 
     public void Execute(ref SoldierState state, in LocalTransform transform, [EntityIndexInQuery] int entityIndex)
     {
-        // 1. 处理 Stop (Idle)
-        // [修改] 移除了 Hold，因为 Hold 已经被 Hunt 替代，Hunt 需要移动
         if (state.Command == SoldierCommand.Idle)
         {
             state.IsMoving = false;
             return;
         }
 
-        // 2. 处理索敌 (AttackMove, Patrol, Scout, Hunt)
-        // Move (强制移动) 和 Sprint (急行军) 不索敌
         bool enemyInRange = false;
         if (state.Command == SoldierCommand.AttackMove ||
             state.Command == SoldierCommand.Patrol ||
             state.Command == SoldierCommand.Scout ||
-            state.Command == SoldierCommand.Hunt) // [新增] Hunt 也要索敌
+            state.Command == SoldierCommand.Hunt)
         {
-            int searchRange = 3;
+            int searchRange = 3; // 索敌范围
             float3 myPos = transform.Position;
             int cx = (int)math.floor(myPos.x);
             int cz = (int)math.floor(myPos.z);
@@ -85,7 +81,7 @@ public partial struct SoldierBrainJob : IJobEntity
                             if (ZombieTransforms.HasComponent(zombie))
                             {
                                 float distSq = math.distancesq(myPos, ZombieTransforms[zombie].Position);
-                                if (distSq < 324f)
+                                if (distSq < 324f) // 18米射程的平方
                                 {
                                     enemyInRange = true;
                                     goto FoundEnemy;
@@ -101,17 +97,13 @@ public partial struct SoldierBrainJob : IJobEntity
 
         if (enemyInRange)
         {
-            state.IsMoving = false; // 发现敌人，停下射击
+            state.IsMoving = false;
         }
         else
         {
-            state.IsMoving = true; // 没敌人，继续走
+            state.IsMoving = true;
 
-            // 3. 处理到达目标后的逻辑
-            // 只有 Patrol, Scout, Hunt 需要自动更新目标
             float distToTarget = math.distance(transform.Position, state.TargetPosition);
-
-            // 如果目标是 (0,0) (初始值)，或者已经到达，都需要找新目标
             bool needsNewTarget = distToTarget < 1.0f || math.lengthsq(state.TargetPosition) < 0.1f;
 
             if (needsNewTarget)
@@ -124,17 +116,17 @@ public partial struct SoldierBrainJob : IJobEntity
                 }
                 else if (state.Command == SoldierCommand.Scout || state.Command == SoldierCommand.Hunt)
                 {
-                    // [逻辑] 侦察/歼敌：随机找全图的一个平地去
-                    // 这里可以优化为"找最近的未探索区域"，但全图随机对"歼敌"来说也够用了
                     var random = new Unity.Mathematics.Random(Seed + (uint)entityIndex * 100);
 
-                    for (int i = 0; i < 10; i++)
+                    for (int i = 0; i < 15; i++)
                     {
                         int rx = random.NextInt(0, Width);
                         int ry = random.NextInt(0, Height);
                         int index = ry * Width + rx;
+                        byte t = MapData[index].TerrainType;
 
-                        if (MapData[index].TerrainType == 1)
+                        // [修复] 目标点必须是 平地(3) 或 道路(8) 或 矿(10)
+                        if (t == 3 || t == 8 || t == 10)
                         {
                             state.TargetPosition = new float3(rx, 1f, ry);
                             break;

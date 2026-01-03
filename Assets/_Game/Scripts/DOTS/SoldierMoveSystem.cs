@@ -60,7 +60,6 @@ public partial struct SoldierMoveJob : IJobEntity
     {
         if (!state.IsMoving) return;
 
-        // [新增] 地形减速逻辑
         int cx = (int)math.floor(transform.Position.x);
         int cz = (int)math.floor(transform.Position.z);
         float terrainModifier = 1.0f;
@@ -68,9 +67,9 @@ public partial struct SoldierMoveJob : IJobEntity
         if (cx >= 0 && cx < Width && cz >= 0 && cz < Height)
         {
             byte type = MapData[cz * Width + cx].TerrainType;
-            if (type == 3) terrainModifier = 1.2f;
-            else if (type == 5) terrainModifier = 0.7f;
-            else if (type == 6) terrainModifier = 0.4f;
+            if (type == 8) terrainModifier = 1.3f;
+            else if (type == 4) terrainModifier = 0.8f;
+            else if (type == 5) terrainModifier = 0.5f;
         }
 
         float currentSpeed = speed.ValueRO.Value * terrainModifier;
@@ -87,21 +86,23 @@ public partial struct SoldierMoveJob : IJobEntity
         if (state.CurrentFlowFieldEntity != Entity.Null && FlowFieldDataLookup.HasComponent(state.CurrentFlowFieldEntity))
         {
             var ffData = FlowFieldDataLookup[state.CurrentFlowFieldEntity];
-            var ffBuffer = FlowFieldBufferLookup[state.CurrentFlowFieldEntity];
-
-            int localX = (int)math.floor(currentPos.x) - ffData.Offset.x;
-            int localZ = (int)math.floor(currentPos.z) - ffData.Offset.y;
-
-            if (localX >= 0 && localX < ffData.Size.x && localZ >= 0 && localZ < ffData.Size.y)
+            if (FlowFieldBufferLookup.HasBuffer(state.CurrentFlowFieldEntity))
             {
-                int idx = localZ * ffData.Size.x + localX;
-                if (idx < ffBuffer.Length)
+                var ffBuffer = FlowFieldBufferLookup[state.CurrentFlowFieldEntity];
+                int localX = (int)math.floor(currentPos.x) - ffData.Offset.x;
+                int localZ = (int)math.floor(currentPos.z) - ffData.Offset.y;
+
+                if (localX >= 0 && localX < ffData.Size.x && localZ >= 0 && localZ < ffData.Size.y)
                 {
-                    float2 flow2D = ffBuffer[idx].Vector;
-                    if (math.lengthsq(flow2D) > 0.001f)
+                    int idx = localZ * ffData.Size.x + localX;
+                    if (idx < ffBuffer.Length)
                     {
-                        desiredDir = new float3(flow2D.x, 0, flow2D.y);
-                        hasFlowField = true;
+                        float2 flow2D = ffBuffer[idx].Vector;
+                        if (math.lengthsq(flow2D) > 0.001f)
+                        {
+                            desiredDir = new float3(flow2D.x, 0, flow2D.y);
+                            hasFlowField = true;
+                        }
                     }
                 }
             }
@@ -114,6 +115,7 @@ public partial struct SoldierMoveJob : IJobEntity
 
             if (distSq <= stopDistSq)
             {
+                // 到达目标
                 if (state.Command == SoldierCommand.Move ||
                     state.Command == SoldierCommand.AttackMove ||
                     state.Command == SoldierCommand.Sprint)
@@ -174,7 +176,6 @@ public partial struct SoldierMoveJob : IJobEntity
         }
     }
 
-    // [核心修复] 允许森林(5)、沼泽(6)、矿脉(7)通行
     private bool IsWalkable(float x, float z)
     {
         int ix = (int)math.floor(x);
@@ -185,7 +186,8 @@ public partial struct SoldierMoveJob : IJobEntity
         int index = iz * Width + ix;
         byte type = MapData[index].TerrainType;
 
-        if (type == 0 || type == 2 || type == 4) return false;
+        // 修复：使用统一的阻挡列表
+        if (type <= 1 || type == 6 || type == 7 || type == 9) return false;
 
         return true;
     }

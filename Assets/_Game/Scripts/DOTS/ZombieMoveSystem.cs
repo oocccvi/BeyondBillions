@@ -86,13 +86,13 @@ public partial struct ZombieMoveJob : IJobEntity
         {
             int index = z * Width + x;
 
-            // [新增] 地形减速逻辑
+            // [修改] 地形减速逻辑
             float terrainModifier = 1.0f;
-            byte terrainType = MapData[index].TerrainType;
+            byte type = MapData[index].TerrainType;
 
-            if (terrainType == 3) terrainModifier = 1.2f; // 道路加速
-            else if (terrainType == 5) terrainModifier = 0.7f; // 森林减速
-            else if (terrainType == 6) terrainModifier = 0.4f; // 沼泽大幅减速
+            // 保留一点特性：道路加速，但其他阻挡地形不再阻止移动
+            if (type == 8) terrainModifier = 1.3f;
+            else if (type == 4) terrainModifier = 0.8f;
 
             float actualSpeed = speed.Value * terrainModifier;
 
@@ -106,10 +106,17 @@ public partial struct ZombieMoveJob : IJobEntity
                 float wX = u - x0; float wZ = v - z0;
                 x0 = math.clamp(x0, 0, Width - 1); z0 = math.clamp(z0, 0, Height - 1);
                 x1 = math.clamp(x1, 0, Width - 1); z1 = math.clamp(z1, 0, Height - 1);
-                float2 v00 = FlowField[z0 * Width + x0];
-                float2 v10 = FlowField[z0 * Width + x1];
-                float2 v01 = FlowField[z1 * Width + x0];
-                float2 v11 = FlowField[z1 * Width + x1];
+
+                int idx00 = z0 * Width + x0;
+                int idx10 = z0 * Width + x1;
+                int idx01 = z1 * Width + x0;
+                int idx11 = z1 * Width + x1;
+
+                float2 v00 = (idx00 < FlowField.Length) ? FlowField[idx00] : float2.zero;
+                float2 v10 = (idx10 < FlowField.Length) ? FlowField[idx10] : float2.zero;
+                float2 v01 = (idx01 < FlowField.Length) ? FlowField[idx01] : float2.zero;
+                float2 v11 = (idx11 < FlowField.Length) ? FlowField[idx11] : float2.zero;
+
                 float2 bottom = math.lerp(v00, v10, wX);
                 float2 top = math.lerp(v01, v11, wX);
                 flowDir = math.lerp(bottom, top, wZ);
@@ -173,43 +180,20 @@ public partial struct ZombieMoveJob : IJobEntity
             // --- 5. 移动 ---
             if (math.lengthsq(finalDir) > 0.001f)
             {
-                float moveDist = actualSpeed * DeltaTime; // [修改] 使用减速后的速度
+                float moveDist = actualSpeed * DeltaTime;
                 float3 currentPos = transform.Position;
 
                 float nextX = currentPos.x + finalDir.x * moveDist;
+                // [修改] 直接移动，不再判断 IsWalkable，或者 IsWalkable 永远返回 true
                 if (IsWalkable(nextX, currentPos.z))
                 {
                     transform.Position.x = nextX;
-                }
-                else
-                {
-                    if (!isVacuum && math.abs(flowDir.x) > 0.001f)
-                    {
-                        float fallbackX = currentPos.x + flowDir.x * moveDist;
-                        if (IsWalkable(fallbackX, currentPos.z))
-                        {
-                            transform.Position.x = fallbackX;
-                            finalDir.x = flowDir.x;
-                        }
-                    }
                 }
 
                 float nextZ = currentPos.z + finalDir.y * moveDist;
                 if (IsWalkable(transform.Position.x, nextZ))
                 {
                     transform.Position.z = nextZ;
-                }
-                else
-                {
-                    if (!isVacuum && math.abs(flowDir.y) > 0.001f)
-                    {
-                        float fallbackZ = currentPos.z + flowDir.y * moveDist;
-                        if (IsWalkable(transform.Position.x, fallbackZ))
-                        {
-                            transform.Position.z = fallbackZ;
-                            finalDir.y = flowDir.y;
-                        }
-                    }
                 }
 
                 float angle = math.atan2(finalDir.x, finalDir.y);
@@ -218,7 +202,7 @@ public partial struct ZombieMoveJob : IJobEntity
         }
     }
 
-    // [核心修复] 允许森林(5)、沼泽(6)、矿脉(7)通行
+    // [核心修改] 永远返回 true，任何地形都可通行
     private bool IsWalkable(float x, float z)
     {
         int ix = (int)math.floor(x);
@@ -226,13 +210,6 @@ public partial struct ZombieMoveJob : IJobEntity
 
         if (ix < 0 || ix >= Width || iz < 0 || iz >= Height) return false;
 
-        int index = iz * Width + ix;
-        byte type = MapData[index].TerrainType;
-
-        // 0=水, 2=山, 4=废墟 是阻挡
-        if (type == 0 || type == 2 || type == 4) return false;
-
-        // 1=平原, 3=道路, 5=森林, 6=沼泽, 7=矿脉 都是可行的
-        return true;
+        return true; // 移除所有阻挡判断
     }
 }

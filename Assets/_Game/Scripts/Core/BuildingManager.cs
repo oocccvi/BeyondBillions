@@ -7,7 +7,6 @@ using System.Collections.Generic;
 
 public class BuildingManager : MonoBehaviour
 {
-    // ... (BuildMode 枚举等保持不变)
     public static BuildingManager Instance { get; private set; }
 
     [Header("设置")]
@@ -32,9 +31,6 @@ public class BuildingManager : MonoBehaviour
         if (Instance != null && Instance != this) Destroy(this);
         Instance = this;
     }
-
-    // ... (Update, ToggleBuildMode, ClearBuildMode, UpdateGridState, UpdatePlacementPreview, GetBuildingSize, CheckPlacementValidity, HandleMapClick 均保持不变，可以直接复制以前的) ...
-    // 为节省篇幅，这里重点展示修改后的 UpdateSoldierState
 
     void Update()
     {
@@ -75,34 +71,101 @@ public class BuildingManager : MonoBehaviour
         }
     }
 
-    // ... 省略中间辅助函数，请直接用上面的完整代码 ...
-    // 这里为了演示 UpdateSoldierState 的修改
-
     public void ToggleBuildMode(BuildMode mode) { if (_currentMode == mode) _currentMode = BuildMode.None; else { _currentMode = mode; if (mode == BuildMode.Turret || mode == BuildMode.HQ || mode == BuildMode.Soldier) _selectedSoldiers.Clear(); } UpdateGridState(); }
     public void ClearBuildMode() { _currentMode = BuildMode.None; UpdateGridState(); if (GridOverlay.Instance != null) GridOverlay.Instance.ClearHighlight(); }
     void UpdateGridState() { if (GridOverlay.Instance != null) { bool shouldShow = _tabGridEnabled || (_currentMode != BuildMode.None); GridOverlay.Instance.ShowGrid(shouldShow); if (_currentMode == BuildMode.None) GridOverlay.Instance.gridColor = _defaultGridColor; } }
-    void UpdatePlacementPreview() { if (GridOverlay.Instance == null) return; Ray ray = Camera.main.ScreenPointToRay(Input.mousePosition); RaycastHit hit; if (Physics.Raycast(ray, out hit, 1000f)) { int x = Mathf.RoundToInt(hit.point.x); int z = Mathf.RoundToInt(hit.point.z); int size = GetBuildingSize(_currentMode); bool isValid = CheckPlacementValidity(x, z); Color color = isValid ? _validColor : _invalidColor; GridOverlay.Instance.SetHighlight(x, z, size, color); } else GridOverlay.Instance.ClearHighlight(); }
+
+    void UpdatePlacementPreview()
+    {
+        if (GridOverlay.Instance == null) return;
+        Ray ray = Camera.main.ScreenPointToRay(Input.mousePosition);
+        RaycastHit hit;
+        if (Physics.Raycast(ray, out hit, 1000f))
+        {
+            int x = Mathf.RoundToInt(hit.point.x);
+            int z = Mathf.RoundToInt(hit.point.z);
+            int size = GetBuildingSize(_currentMode);
+            bool isValid = CheckPlacementValidity(x, z);
+            Color color = isValid ? _validColor : _invalidColor;
+            GridOverlay.Instance.SetHighlight(x, z, size, color);
+        }
+        else GridOverlay.Instance.ClearHighlight();
+    }
+
     int GetBuildingSize(BuildMode mode) { switch (mode) { case BuildMode.Turret: return 2; case BuildMode.HQ: return 4; default: return 1; } }
-    bool CheckPlacementValidity(int centerX, int centerZ) { if (MapGenerator.Instance == null) return false; int size = GetBuildingSize(_currentMode); int offset = size / 2; for (int x = centerX - offset; x < centerX - offset + size; x++) { for (int z = centerZ - offset; z < centerZ - offset + size; z++) { if (x < 0 || x >= MapGenerator.Instance.width || z < 0 || z >= MapGenerator.Instance.height) return false; var mapData = MapGenerator.Instance.MapData; int index = z * MapGenerator.Instance.width + x; var cell = mapData[index]; if (cell.TerrainType != 1) return false; if (cell.BuildingType != 0) return false; } } return true; }
-    void HandleMapClick() { Ray ray = Camera.main.ScreenPointToRay(Input.mousePosition); RaycastHit hit; if (Physics.Raycast(ray, out hit, 1000f)) { int x = Mathf.RoundToInt(hit.point.x); int z = Mathf.RoundToInt(hit.point.z); if (_currentMode == BuildMode.HQ || _currentMode == BuildMode.Turret || _currentMode == BuildMode.Soldier) { if (CheckPlacementValidity(x, z)) { if (_currentMode == BuildMode.HQ) BuildHQ(x, z); else if (_currentMode == BuildMode.Turret) { if (!hasPlacedHQ) { Debug.LogWarning("必须先放置 HQ！"); return; } BuildTurret(x, z); } else if (_currentMode == BuildMode.Soldier) { if (!hasPlacedHQ) { Debug.LogWarning("必须先放置 HQ！"); return; } BuildSoldier(hit.point); } } } else if (_currentMode == BuildMode.Command_AttackMove) { IssueCommand(SoldierCommand.AttackMove, hit.point); ClearBuildMode(); } else if (_currentMode == BuildMode.Command_Patrol) { IssueCommand(SoldierCommand.Patrol, hit.point); ClearBuildMode(); } else if (_currentMode == BuildMode.Command_Scout) { IssueCommand(SoldierCommand.Scout, hit.point); ClearBuildMode(); } } }
+
+    bool CheckPlacementValidity(int centerX, int centerZ)
+    {
+        if (MapGenerator.Instance == null) return false;
+        int size = GetBuildingSize(_currentMode);
+        int offset = size / 2;
+
+        for (int x = centerX - offset; x < centerX - offset + size; x++)
+        {
+            for (int z = centerZ - offset; z < centerZ - offset + size; z++)
+            {
+                if (x < 0 || x >= MapGenerator.Instance.width || z < 0 || z >= MapGenerator.Instance.height) return false;
+                var mapData = MapGenerator.Instance.MapData;
+                int index = z * MapGenerator.Instance.width + x;
+                var cell = mapData[index];
+                byte t = cell.TerrainType;
+
+                // 阻挡地形: 0(DeepWater), 1(Water), 6(Mountain), 7(Snow), 9(Ruins)
+                // 允许地形: 2(Sand), 3(Grass), 4(Forest), 5(Swamp), 8(Road), 10(Ore)
+                if (t <= 1 || t == 6 || t == 7 || t == 9) return false;
+
+                // 检查是否已有建筑
+                if (cell.BuildingType != 0) return false;
+            }
+        }
+        return true;
+    }
+
+    void HandleMapClick()
+    {
+        Ray ray = Camera.main.ScreenPointToRay(Input.mousePosition);
+        RaycastHit hit;
+        if (Physics.Raycast(ray, out hit, 1000f))
+        {
+            int x = Mathf.RoundToInt(hit.point.x);
+            int z = Mathf.RoundToInt(hit.point.z);
+            if (_currentMode == BuildMode.HQ || _currentMode == BuildMode.Turret || _currentMode == BuildMode.Soldier)
+            {
+                if (CheckPlacementValidity(x, z))
+                {
+                    if (_currentMode == BuildMode.HQ) BuildHQ(x, z);
+                    else if (_currentMode == BuildMode.Turret)
+                    {
+                        if (!hasPlacedHQ) { Debug.LogWarning("必须先放置 HQ！"); return; }
+                        BuildTurret(x, z);
+                    }
+                    else if (_currentMode == BuildMode.Soldier)
+                    {
+                        if (!hasPlacedHQ) { Debug.LogWarning("必须先放置 HQ！"); return; }
+                        BuildSoldier(hit.point);
+                    }
+                }
+            }
+            else if (_currentMode == BuildMode.Command_AttackMove) { IssueCommand(SoldierCommand.AttackMove, hit.point); ClearBuildMode(); }
+            else if (_currentMode == BuildMode.Command_Patrol) { IssueCommand(SoldierCommand.Patrol, hit.point); ClearBuildMode(); }
+            else if (_currentMode == BuildMode.Command_Scout) { IssueCommand(SoldierCommand.Scout, hit.point); ClearBuildMode(); }
+        }
+    }
 
     void IssueStop() { UpdateSoldierState(SoldierCommand.Idle, Vector3.zero); }
     void IssueHunt() { UpdateSoldierState(SoldierCommand.Hunt, Vector3.zero); }
     void IssueCommand(SoldierCommand cmd, Vector3 targetOverride = default) { Vector3 target = targetOverride; if (targetOverride == default) { Ray ray = Camera.main.ScreenPointToRay(Input.mousePosition); if (Physics.Raycast(ray, out RaycastHit hit, 1000f)) target = hit.point; else return; } UpdateSoldierState(cmd, target); }
 
-    // [核心修改]
     void UpdateSoldierState(SoldierCommand cmd, Vector3 targetPos)
     {
         EntityManager em = World.DefaultGameObjectInjectionWorld.EntityManager;
         float3 tPos = new float3(targetPos.x, 1f, targetPos.z);
 
-        // 如果指令需要移动 (Move, AttackMove, Sprint)，则请求生成流场
         Entity flowFieldEntity = Entity.Null;
         if (cmd == SoldierCommand.Move || cmd == SoldierCommand.AttackMove || cmd == SoldierCommand.Sprint)
         {
             if (FlowFieldController.Instance != null && _selectedSoldiers.Count > 0)
             {
-                // 为这组士兵请求一个局部流场
                 flowFieldEntity = FlowFieldController.Instance.CreateLocalFlowField(_selectedSoldiers, tPos);
             }
         }
@@ -116,7 +179,6 @@ public class BuildingManager : MonoBehaviour
                 state.Command = cmd;
                 state.TargetPosition = tPos;
 
-                // [新增] 分配流场 ID
                 state.CurrentFlowFieldEntity = flowFieldEntity;
 
                 if (cmd == SoldierCommand.Idle) state.IsMoving = false;
@@ -137,7 +199,29 @@ public class BuildingManager : MonoBehaviour
     }
 
     void CommandSoldiersMove(SoldierCommand commandType = SoldierCommand.AttackMove) { Ray ray = Camera.main.ScreenPointToRay(Input.mousePosition); if (Physics.Raycast(ray, out RaycastHit hit, 1000f)) { UpdateSoldierState(commandType, hit.point); } }
-    void BuildHQ(int x, int z) { if (hasPlacedHQ) return; if (ResourceManager.Instance == null) return; if (ResourceManager.Instance.TrySpendGold(ResourceManager.Instance.hqCost)) { if (TurretSpawner.Instance != null) { TurretSpawner.Instance.SpawnHQ(new float3(x, 0, z)); hasPlacedHQ = true; ClearBuildMode(); } } }
+
+    void BuildHQ(int x, int z)
+    {
+        if (hasPlacedHQ) return;
+        if (ResourceManager.Instance == null) return;
+        if (ResourceManager.Instance.TrySpendGold(ResourceManager.Instance.hqCost))
+        {
+            if (TurretSpawner.Instance != null)
+            {
+                TurretSpawner.Instance.SpawnHQ(new float3(x, 0, z));
+
+                // [核心修复] 建造 HQ 后，立即通知流场控制器注册坐标！
+                if (FlowFieldController.Instance != null)
+                {
+                    FlowFieldController.Instance.RegisterHQ(x, z);
+                }
+
+                hasPlacedHQ = true;
+                ClearBuildMode();
+            }
+        }
+    }
+
     void BuildTurret(int x, int z) { if (ResourceManager.Instance == null) return; if (ResourceManager.Instance.TrySpendGold(ResourceManager.Instance.turretCost)) { if (TurretSpawner.Instance != null) TurretSpawner.Instance.SpawnTurret(new float3(x, 0, z)); } }
     void BuildSoldier(Vector3 p) { if (ResourceManager.Instance == null) return; if (ResourceManager.Instance.TrySpendGold(ResourceManager.Instance.soldierCost)) { if (SoldierSpawner.Instance != null) SoldierSpawner.Instance.SpawnSoldier(new float3(p.x, 0, p.z)); } }
     void FinishSelection()

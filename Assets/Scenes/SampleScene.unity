@@ -815,10 +815,11 @@ MonoBehaviour:
   safeZoneRadius: 40
   cityAvoidanceRadius: 30
   currentWave: 0
-  timeToNextWave: 600
+  timeToNextWave: 30
   isWaveActive: 0
-  baseCount: 50
-  difficultyMultiplier: 1.5
+  baseWaveCount: 20
+  countMultiplier: 1.2
+  maxSpawnPoints: 4
   zombieMesh: {fileID: 10202, guid: 0000000000000000e000000000000000, type: 0}
   zombieMaterial: {fileID: 2100000, guid: 4700c054c55bd2c43ad5f3f4fa6a563c, type: 2}
   zombieSpeed: 5
@@ -935,6 +936,8 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   showGrid: 0
   gridColor: {r: 1, g: 1, b: 1, a: 0.3}
+  yOffset: 0.02
+  gridMaterial: {fileID: 0}
 --- !u!114 &1957025202
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -982,7 +985,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 0
+  m_IsActive: 1
 --- !u!4 &2059938601
 Transform:
   m_ObjectHideFlags: 0
@@ -1005,16 +1008,22 @@ MonoBehaviour:
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 2059938599}
-  m_Enabled: 0
+  m_Enabled: 1
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: 2e9cce4edef101343aa7080a7c9a8781, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  spawnCount: 1000
+  spawnCount: 10
+  spawnMode: 0
   unitMesh: {fileID: 10202, guid: 0000000000000000e000000000000000, type: 0}
   unitMaterial: {fileID: 2100000, guid: 4700c054c55bd2c43ad5f3f4fa6a563c, type: 2}
   zombieSpeed: 5
   zombieHealth: 100
+  enableAutoSpawn: 1
+  spawnInterval: 10
+  difficultyMultiplier: 1.2
+  maxAutoSpawnCount: 20
+  initialBehavior: 0
 --- !u!1 &2077723260
 GameObject:
   m_ObjectHideFlags: 0
