@@ -1,4 +1,4 @@
-using UnityEngine; // 必须引用以使用 Vector2Int
+using UnityEngine;
 using Unity.Entities;
 using Unity.Transforms;
 using Unity.Burst;
@@ -6,8 +6,9 @@ using Unity.Collections;
 using Unity.Mathematics;
 using Unity.Jobs;
 
-// 共享数据：迷雾地图状态
-// 0=Unknown, 1=Explored(Fog), 2=Visible
+// 共享数据
+// 0=未探索(有云), 2=已探索(无云)
+// (状态 1 已废弃，因为不需要半透明层了)
 public struct FogMapData : IComponentData
 {
     public NativeArray<byte> GridStatus;
@@ -21,21 +22,15 @@ public partial struct FogOfWarSystem : ISystem
     private NativeArray<byte> _gridStatus;
     private Entity _singletonEntity;
 
-    public void OnCreate(ref SystemState state)
-    {
-    }
-
     public void OnDestroy(ref SystemState state)
     {
-        // 销毁前确保 Job 完成，防止内存泄漏警告
         state.Dependency.Complete();
         if (_gridStatus.IsCreated) _gridStatus.Dispose();
     }
 
-    // 主线程 Update
     public void OnUpdate(ref SystemState state)
     {
-        // 检测重置信号：如果数据还在但实体没了（被 GameResultManager 删了），说明重开了
+        // 游戏重开检测
         if (_gridStatus.IsCreated && !state.EntityManager.Exists(_singletonEntity))
         {
             state.Dependency.Complete();
@@ -52,13 +47,10 @@ public partial struct FogOfWarSystem : ISystem
                 int h = MapGenerator.Instance.height;
                 _gridStatus = new NativeArray<byte>(w * h, Allocator.Persistent);
 
-                // [核心修复] 初始开视野位置跟随玩家出生点
-                // 之前写死 cx = w/2, cz = h/2，导致迷雾只在地图中间打开
                 Vector2Int spawn = MapGenerator.Instance.PlayerSpawnPoint;
                 int cx = spawn.x;
                 int cz = spawn.y;
-
-                int initRadius = 45; // 初始视野半径
+                int initRadius = 45;
                 int rSq = initRadius * initRadius;
 
                 for (int x = 0; x < w; x++)
@@ -68,14 +60,8 @@ public partial struct FogOfWarSystem : ISystem
                         int index = z * w + x;
                         int distSq = (x - cx) * (x - cx) + (z - cz) * (z - cz);
 
-                        if (distSq <= rSq)
-                        {
-                            _gridStatus[index] = 2; // 可见
-                        }
-                        else
-                        {
-                            _gridStatus[index] = 0; // 未探索
-                        }
+                        if (distSq <= rSq) _gridStatus[index] = 2; // 初始可见
+                        else _gridStatus[index] = 0; // 初始迷雾
                     }
                 }
 
@@ -91,11 +77,11 @@ public partial struct FogOfWarSystem : ISystem
         }
 
         // 2. 调度 Job
-        // A. 降级 Job (可见 -> 迷雾)
-        var resetJob = new FogResetJob { Grid = _gridStatus };
-        state.Dependency = resetJob.Schedule(_gridStatus.Length, 64, state.Dependency);
+        // [修改 1] 移除了 FogResetJob
+        // 我们不再需要把“可见”降级为“半透明”，所以直接跳过重置步骤。
+        // 一旦格子被 FogVisionJob 标记为 2，它就永远是 2。
 
-        // B. 视野 Job (单位开视野)
+        // A. 视野 Job (只负责开视野)
         var width = MapGenerator.Instance.width;
         var height = MapGenerator.Instance.height;
 
@@ -107,23 +93,7 @@ public partial struct FogOfWarSystem : ISystem
         };
         state.Dependency = visionJob.ScheduleParallel(state.Dependency);
 
-        // 强制等待 Job 完成，以便 FogOfWarDisplay 读取数据
         state.Dependency.Complete();
-    }
-}
-
-[BurstCompile]
-public partial struct FogResetJob : IJobParallelFor
-{
-    public NativeArray<byte> Grid;
-
-    public void Execute(int index)
-    {
-        // 如果当前是 Visible(2)，降级为 Explored(1)
-        if (Grid[index] == 2)
-        {
-            Grid[index] = 1;
-        }
     }
 }
 
@@ -152,7 +122,9 @@ public partial struct FogVisionJob : IJobEntity
                     int distSq = (x - cx) * (x - cx) + (z - cz) * (z - cz);
                     if (distSq <= rSq)
                     {
-                        Grid[z * Width + x] = 2; // 标记为可见
+                        // 直接标记为 2 (可见)
+                        // 由于没有 ResetJob，这个 2 会永久保留
+                        Grid[z * Width + x] = 2;
                     }
                 }
             }

@@ -6,20 +6,24 @@ public class FogOfWarDisplay : MonoBehaviour
 {
     public static FogOfWarDisplay Instance { get; private set; }
 
-    [Header("设置")]
+    [Header("外观设置")]
+    public Material fogMaterial;
+    public Texture2D noiseTexture;
+
+    [Header("性能设置")]
     public float updateInterval = 0.1f;
-    public Color unknownColor = Color.black;
-    public Color exploredColor = new Color(0, 0, 0, 0.6f);
+    // 未探索区域：白色 (Alpha 1) -> Shader 显示厚云
+    public Color unknownColor = Color.white;
+    // [修改] 已探索区域：透明 (Alpha 0) -> Shader 不显示云
+    // 不需要 ExploredColor 了，因为没有中间状态
+    public Color visibleColor = new Color(0, 0, 0, 0);
 
     private Texture2D _fogTexture;
     private float _timer;
-    private MeshRenderer _renderer;
+    private MeshRenderer _meshRenderer;
 
     private EntityQuery _fogDataQuery;
     private EntityManager _entityManager;
-
-    // [新增] 地图全开状态
-    private bool _isMapRevealed = false;
 
     void Awake()
     {
@@ -31,26 +35,6 @@ public class FogOfWarDisplay : MonoBehaviour
     {
         _entityManager = World.DefaultGameObjectInjectionWorld.EntityManager;
         _fogDataQuery = _entityManager.CreateEntityQuery(typeof(FogMapData));
-
-        CreateTemporaryCurtain();
-    }
-
-    void CreateTemporaryCurtain()
-    {
-        GameObject curtain = GameObject.CreatePrimitive(PrimitiveType.Quad);
-        curtain.name = "Fog_Curtain";
-        curtain.transform.SetParent(transform);
-        curtain.transform.eulerAngles = new Vector3(90, 0, 0);
-        curtain.transform.position = new Vector3(0, 20f, 0);
-        curtain.transform.localScale = new Vector3(5000, 5000, 1);
-
-        var rend = curtain.GetComponent<MeshRenderer>();
-        rend.material = new Material(Shader.Find("Unlit/Color"));
-        rend.material.color = Color.black;
-
-        Destroy(curtain.GetComponent<Collider>());
-
-        _renderer = rend;
     }
 
     void InitFog()
@@ -60,20 +44,22 @@ public class FogOfWarDisplay : MonoBehaviour
         int w = MapGenerator.Instance.width;
         int h = MapGenerator.Instance.height;
 
-        if (_renderer != null) Destroy(_renderer.gameObject);
+        if (_meshRenderer != null) Destroy(_meshRenderer.gameObject);
 
         GameObject fogObj = GameObject.CreatePrimitive(PrimitiveType.Quad);
         fogObj.name = "FogOfWar_Overlay";
         fogObj.transform.SetParent(transform);
-
         fogObj.transform.eulerAngles = new Vector3(90, 0, 0);
-        fogObj.transform.position = new Vector3(w / 2f, 12f, h / 2f);
+
+        // 贴地
+        fogObj.transform.position = new Vector3(w / 2f, 0.1f, h / 2f);
         fogObj.transform.localScale = new Vector3(w, h, 1);
 
-        _renderer = fogObj.GetComponent<MeshRenderer>();
-        _fogTexture = new Texture2D(w, h, TextureFormat.RGBA32, false);
+        _meshRenderer = fogObj.GetComponent<MeshRenderer>();
+        Destroy(fogObj.GetComponent<Collider>());
 
-        _fogTexture.filterMode = FilterMode.Point;
+        _fogTexture = new Texture2D(w, h, TextureFormat.RGBA32, false);
+        _fogTexture.filterMode = FilterMode.Bilinear;
         _fogTexture.wrapMode = TextureWrapMode.Clamp;
 
         Color[] pixels = new Color[w * h];
@@ -81,42 +67,29 @@ public class FogOfWarDisplay : MonoBehaviour
         _fogTexture.SetPixels(pixels);
         _fogTexture.Apply();
 
-        Material mat = new Material(Shader.Find("Particles/Standard Unlit"));
-        mat.SetColor("_Color", Color.white);
-        mat.mainTexture = _fogTexture;
-        mat.SetFloat("_Mode", 2);
-        mat.SetInt("_SrcBlend", (int)UnityEngine.Rendering.BlendMode.SrcAlpha);
-        mat.SetInt("_DstBlend", (int)UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha);
-        mat.SetInt("_ZWrite", 0);
-        mat.DisableKeyword("_ALPHATEST_ON");
-        mat.EnableKeyword("_ALPHABLEND_ON");
-        mat.DisableKeyword("_ALPHAPREMULTIPLY_ON");
-        mat.renderQueue = 3000;
+        if (fogMaterial != null)
+        {
+            _meshRenderer.material = new Material(fogMaterial);
+            _meshRenderer.material.mainTexture = _fogTexture;
 
-        _renderer.material = mat;
+            // [关键新增] 将地图尺寸传给 Shader
+            // 这样 Shader 就能自动计算出正确的偏移量
+            _meshRenderer.material.SetFloat("_MapSize", (float)w);
 
-        Destroy(fogObj.GetComponent<Collider>());
-
-        // 初始化时应用当前全开状态
-        _renderer.enabled = !_isMapRevealed;
+            if (noiseTexture != null)
+            {
+                _meshRenderer.material.SetTexture("_NoiseTex", noiseTexture);
+            }
+        }
     }
 
     void Update()
     {
-        // [新增] 按 F4 切换地图全开
-        if (Input.GetKeyDown(KeyCode.F4))
-        {
-            ToggleMapReveal();
-        }
-
         if (_fogTexture == null)
         {
             InitFog();
             return;
         }
-
-        // 如果地图全开了，就没必要浪费性能去刷新贴图了
-        if (_isMapRevealed) return;
 
         _timer += Time.deltaTime;
         if (_timer < updateInterval) return;
@@ -125,35 +98,33 @@ public class FogOfWarDisplay : MonoBehaviour
         UpdateTexture();
     }
 
-    public void ToggleMapReveal()
-    {
-        _isMapRevealed = !_isMapRevealed;
-        if (_renderer != null)
-        {
-            _renderer.enabled = !_isMapRevealed;
-        }
-        Debug.Log($"Map Reveal: {_isMapRevealed}");
-    }
-
     void UpdateTexture()
     {
         if (_fogDataQuery.IsEmptyIgnoreFilter) return;
 
         var data = _fogDataQuery.GetSingleton<FogMapData>();
-
         if (!data.GridStatus.IsCreated) return;
 
         NativeArray<Color32> colors = new NativeArray<Color32>(data.GridStatus.Length, Allocator.Temp);
-        Color32 cUnknown = unknownColor;
-        Color32 cExplored = exploredColor;
-        Color32 cVisible = new Color32(0, 0, 0, 0);
+
+        Color32 cUnknown = unknownColor; // 白 (有云)
+        Color32 cVisible = visibleColor; // 透明 (无云)
 
         for (int i = 0; i < data.GridStatus.Length; i++)
         {
             byte status = data.GridStatus[i];
-            if (status == 0) colors[i] = cUnknown;
-            else if (status == 1) colors[i] = cExplored;
-            else colors[i] = cVisible;
+
+            // [逻辑简化]
+            // 0 = 未探索 -> 显示云
+            // 任何非 0 值 (1或2) -> 都是已探索 -> 显示透明
+            if (status == 0)
+            {
+                colors[i] = cUnknown;
+            }
+            else
+            {
+                colors[i] = cVisible;
+            }
         }
 
         _fogTexture.SetPixelData(colors, 0);

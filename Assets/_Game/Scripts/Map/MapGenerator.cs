@@ -62,6 +62,8 @@ public class MapGenerator : MonoBehaviour
     [Header("--- 4. 水文模拟 (Rivers) ---")]
     public int riverCount = 25;
     public int riverMinLength = 15;
+    [Tooltip("河流最大延伸长度")]
+    public int riverMaxLength = 200; // [新增] 控制河流最大长度
     public int riverCarveRadius = 2;
     public float minRiverHeight = 0.4f;
     public float maxRiverHeight = 0.9f;
@@ -386,7 +388,8 @@ public class MapGenerator : MonoBehaviour
             int cx = x, cy = y;
             bool reachedWater = false;
 
-            for (int k = 0; k < 200; k++)
+            // [Modified] 使用变量 riverMaxLength 控制河流最大长度 (原为硬编码 200)
+            for (int k = 0; k < riverMaxLength; k++)
             {
                 path.Add(cy * width + cx);
                 float minH = _heightMap[cy * width + cx];

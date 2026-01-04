@@ -8,7 +8,6 @@ using Unity.Collections.LowLevel.Unsafe;
 [UpdateBefore(typeof(ZombieMoveSystem))]
 public partial struct ZombieAttackSystem : ISystem
 {
-    // [关键修复] 必须加上 OnDestroy，否则停止游戏时会报 InvalidOperationException
     public void OnDestroy(ref SystemState state)
     {
         state.Dependency.Complete();
@@ -16,9 +15,7 @@ public partial struct ZombieAttackSystem : ISystem
 
     public void OnUpdate(ref SystemState state)
     {
-        if (MapGenerator.Instance == null ||
-            !MapGenerator.Instance.BuildingMap.IsCreated ||
-            !MapGenerator.Instance.IsInitialized) return;
+        if (MapGenerator.Instance == null || !MapGenerator.Instance.BuildingMap.IsCreated) return;
 
         var buildingMap = MapGenerator.Instance.BuildingMap;
         var mapData = MapGenerator.Instance.MapData;
@@ -29,31 +26,25 @@ public partial struct ZombieAttackSystem : ISystem
             soldierMap = SystemAPI.GetSingleton<SoldierSpatialMap>().Map;
         }
 
-        var width = MapGenerator.Instance.width;
-        var height = MapGenerator.Instance.height;
         var ecbSingleton = SystemAPI.GetSingleton<BeginSimulationEntityCommandBufferSystem.Singleton>();
         var ecb = ecbSingleton.CreateCommandBuffer(state.WorldUnmanaged).AsParallelWriter();
 
-        float dt = SystemAPI.Time.DeltaTime;
-
-        new ZombieAttackJob
+        // [修复] 必须将 JobHandle 赋值给 state.Dependency，形成依赖链
+        state.Dependency = new ZombieAttackJob
         {
-            DeltaTime = dt,
+            DeltaTime = SystemAPI.Time.DeltaTime,
             BuildingMap = buildingMap,
             SoldierMap = soldierMap,
             MapData = mapData,
-            Width = width,
-            Height = height,
+            Width = MapGenerator.Instance.width,
+            Height = MapGenerator.Instance.height,
             BuildingHealthLookup = SystemAPI.GetComponentLookup<BuildingHealth>(false),
             SoldierHealthLookup = SystemAPI.GetComponentLookup<SoldierHealth>(false),
-            // DeadTagLookup 移除了，因为 CombatComponents 可能没定义，直接用 HasComponent 判断即可
-            // 或者如果定义了，可以加回来。为了稳妥，这里先不传 DeadTagLookup，直接用 HasComponent
-            // 如果您确定 CombatComponents 里有 DeadBuildingTag，可以保留下行：
             DeadTagLookup = SystemAPI.GetComponentLookup<DeadBuildingTag>(true),
             MainBaseLookup = SystemAPI.GetComponentLookup<MainBaseTag>(true),
             TransformLookup = SystemAPI.GetComponentLookup<LocalTransform>(true),
             Ecb = ecb
-        }.ScheduleParallel();
+        }.ScheduleParallel(state.Dependency);
     }
 }
 
@@ -67,25 +58,23 @@ public partial struct ZombieAttackJob : IJobEntity
     public int Width;
     public int Height;
 
-    [NativeDisableParallelForRestriction]
-    public ComponentLookup<BuildingHealth> BuildingHealthLookup;
-
-    [NativeDisableParallelForRestriction]
-    public ComponentLookup<SoldierHealth> SoldierHealthLookup;
-
+    [NativeDisableParallelForRestriction] public ComponentLookup<BuildingHealth> BuildingHealthLookup;
+    [NativeDisableParallelForRestriction] public ComponentLookup<SoldierHealth> SoldierHealthLookup;
     [ReadOnly] public ComponentLookup<DeadBuildingTag> DeadTagLookup;
     [ReadOnly] public ComponentLookup<MainBaseTag> MainBaseLookup;
-
-    [ReadOnly]
-    [NativeDisableContainerSafetyRestriction]
-    public ComponentLookup<LocalTransform> TransformLookup;
+    [ReadOnly] public ComponentLookup<LocalTransform> TransformLookup;
 
     public EntityCommandBuffer.ParallelWriter Ecb;
 
     enum TargetType { None, Building, Soldier }
 
-    public void Execute(Entity zombieEntity, [EntityIndexInQuery] int sortKey, ref LocalTransform transform, ref MoveSpeed speed, in ZombieHealth zombieHealth)
+    public void Execute(Entity zombieEntity, [EntityIndexInQuery] int sortKey, in LocalTransform transform, ref ZombieState state, in ZombieHealth zombieHealth)
     {
+        if (state.AttackCooldown > 0)
+        {
+            state.AttackCooldown -= DeltaTime;
+        }
+
         int x = (int)math.floor(transform.Position.x);
         int z = (int)math.floor(transform.Position.z);
 
@@ -94,9 +83,7 @@ public partial struct ZombieAttackJob : IJobEntity
         float minTargetDistSq = float.MaxValue;
         float3 bestTargetPos = float3.zero;
 
-        // 1. 感知阶段
-        int searchRange = 4;
-        if (zombieHealth.Value < zombieHealth.Max) searchRange = 10;
+        int searchRange = (zombieHealth.Value < zombieHealth.Max) ? 8 : 4;
 
         for (int xOffset = -searchRange; xOffset <= searchRange; xOffset++)
         {
@@ -104,46 +91,39 @@ public partial struct ZombieAttackJob : IJobEntity
             {
                 int nx = x + xOffset;
                 int nz = z + zOffset;
-
                 if (nx < 0 || nx >= Width || nz < 0 || nz >= Height) continue;
 
                 int index = nz * Width + nx;
 
-                // --- A. 检查建筑 ---
                 if (BuildingMap.TryGetValue(index, out Entity buildingEntity))
                 {
-                    if (BuildingHealthLookup.HasComponent(buildingEntity) &&
-                        !DeadTagLookup.HasComponent(buildingEntity) &&
-                        TransformLookup.HasComponent(buildingEntity))
+                    if (BuildingHealthLookup.HasComponent(buildingEntity) && !DeadTagLookup.HasComponent(buildingEntity))
                     {
-                        float3 targetCenter = TransformLookup[buildingEntity].Position;
-                        float distSq = math.distancesq(transform.Position, targetCenter);
-
+                        float3 tPos = new float3(nx + 0.5f, 0, nz + 0.5f);
+                        float distSq = math.distancesq(transform.Position, tPos);
                         if (distSq < minTargetDistSq)
                         {
                             minTargetDistSq = distSq;
                             bestTarget = buildingEntity;
-                            bestTargetPos = targetCenter;
+                            bestTargetPos = tPos;
                             targetType = TargetType.Building;
                         }
                     }
                 }
 
-                // --- B. 检查士兵 ---
                 if (SoldierMap.IsCreated && SoldierMap.TryGetFirstValue(index, out Entity soldierEntity, out var it))
                 {
                     do
                     {
                         if (SoldierHealthLookup.HasComponent(soldierEntity) && TransformLookup.HasComponent(soldierEntity))
                         {
-                            float3 targetCenter = TransformLookup[soldierEntity].Position;
-                            float distSq = math.distancesq(transform.Position, targetCenter);
-
+                            float3 tPos = TransformLookup[soldierEntity].Position;
+                            float distSq = math.distancesq(transform.Position, tPos);
                             if (distSq < minTargetDistSq)
                             {
                                 minTargetDistSq = distSq;
                                 bestTarget = soldierEntity;
-                                bestTargetPos = targetCenter;
+                                bestTargetPos = tPos;
                                 targetType = TargetType.Soldier;
                             }
                         }
@@ -152,116 +132,55 @@ public partial struct ZombieAttackJob : IJobEntity
             }
         }
 
-        // 2. 决策阶段
         if (bestTarget != Entity.Null)
         {
-            // 基础攻击距离 (1.5米平方 = 2.25)
             float attackRangeSq = 2.25f;
-            bool isHQ = false;
-
-            if (targetType == TargetType.Building && MainBaseLookup.HasComponent(bestTarget))
-            {
-                // [设置] HQ 攻击距离：4米 (4x4 = 16)
-                attackRangeSq = 16.0f;
-                isHQ = true;
-            }
-
-            if (targetType == TargetType.Soldier) attackRangeSq = 3.0f;
+            if (targetType == TargetType.Building && MainBaseLookup.HasComponent(bestTarget)) attackRangeSq = 16.0f;
+            if (targetType == TargetType.Soldier) attackRangeSq = 2.0f;
 
             if (minTargetDistSq <= attackRangeSq)
             {
-                // --- 攻击 ---
-                Attack(sortKey, bestTarget, targetType, DeltaTime);
-                speed.Value = 0;
+                state.Behavior = ZombieBehavior.Attack;
+                state.TargetPosition = bestTargetPos;
+
+                if (state.AttackCooldown <= 0)
+                {
+                    ApplyDamage(sortKey, bestTarget, targetType);
+                    state.AttackCooldown = 1.0f;
+                }
             }
             else
             {
-                // --- 追击 ---
-                float chaseSpeed = 6f;
-                float3 dir = math.normalizesafe(bestTargetPos - transform.Position);
-                float3 nextPos = transform.Position + dir * chaseSpeed * DeltaTime;
-
-                int nextX = (int)math.floor(nextPos.x);
-                int nextZ = (int)math.floor(nextPos.z);
-
-                bool canChase = true;
-                bool hitTarget = false;
-
-                if (nextX >= 0 && nextX < Width && nextZ >= 0 && nextZ < Height)
-                {
-                    int nextIndex = nextZ * Width + nextX;
-                    var terrainType = MapData[nextIndex].TerrainType;
-
-                    if (terrainType == 0) canChase = false;
-                    else if (terrainType == 2)
-                    {
-                        if (BuildingMap.TryGetValue(nextIndex, out Entity obstacleEntity))
-                        {
-                            if (obstacleEntity == bestTarget || isHQ)
-                            {
-                                canChase = false;
-                                hitTarget = true;
-                            }
-                            else canChase = false;
-                        }
-                        else canChase = false;
-                    }
-                }
-
-                if (hitTarget)
-                {
-                    // 撞到了 HQ 模型，强制攻击
-                    // 必须在合理距离内 (6米 = 36)
-                    if (minTargetDistSq <= 36.0f)
-                    {
-                        Attack(sortKey, bestTarget, targetType, DeltaTime);
-                    }
-                    speed.Value = 0;
-                }
-                else if (canChase)
-                {
-                    transform.Position = nextPos;
-                    float angle = math.atan2(dir.x, dir.z);
-                    transform.Rotation = quaternion.RotateY(angle);
-                    speed.Value = 0;
-                }
-                else
-                {
-                    speed.Value = 5f;
-                }
+                state.Behavior = ZombieBehavior.Chase;
+                state.TargetPosition = bestTargetPos;
             }
         }
         else
         {
-            speed.Value = 5f;
+            if (state.Behavior != ZombieBehavior.Wander)
+            {
+                state.Behavior = ZombieBehavior.Rush;
+            }
         }
     }
 
-    private void Attack(int sortKey, Entity target, TargetType type, float dt)
+    private void ApplyDamage(int sortKey, Entity target, TargetType type)
     {
-        float damage = 50f * dt;
+        float damagePerHit = 20f;
 
         if (type == TargetType.Building)
         {
-            var health = BuildingHealthLookup[target];
-            health.Value -= damage;
-            BuildingHealthLookup[target] = health;
-
-            if (health.Value <= 0)
-            {
-                Ecb.AddComponent<DeadBuildingTag>(sortKey, target);
-            }
+            var h = BuildingHealthLookup[target];
+            h.Value -= damagePerHit;
+            BuildingHealthLookup[target] = h;
+            if (h.Value <= 0) Ecb.AddComponent<DeadBuildingTag>(sortKey, target);
         }
         else if (type == TargetType.Soldier)
         {
-            var health = SoldierHealthLookup[target];
-            health.Value -= damage;
-            SoldierHealthLookup[target] = health;
-
-            if (health.Value <= 0)
-            {
-                Ecb.DestroyEntity(sortKey, target);
-            }
+            var h = SoldierHealthLookup[target];
+            h.Value -= damagePerHit;
+            SoldierHealthLookup[target] = h;
+            if (h.Value <= 0) Ecb.DestroyEntity(sortKey, target);
         }
     }
 }

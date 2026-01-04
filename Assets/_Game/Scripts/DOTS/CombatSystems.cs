@@ -5,71 +5,7 @@ using Unity.Collections;
 using Unity.Mathematics;
 using Unity.Collections.LowLevel.Unsafe;
 
-// 0. 共享数据
-public struct ZombieSpatialMap : IComponentData
-{
-    public NativeParallelMultiHashMap<int, Entity> Map;
-}
-
-// 1. 空间哈希系统
-[UpdateBefore(typeof(TurretSystem))]
-[UpdateBefore(typeof(ProjectileSystem))]
-[BurstCompile]
-public partial struct ZombieSpatialSystem : ISystem
-{
-    private NativeParallelMultiHashMap<int, Entity> _zombieMap;
-    private Entity _singletonEntity;
-
-    public void OnCreate(ref SystemState state)
-    {
-        state.RequireForUpdate<ZombieTag>();
-        _zombieMap = new NativeParallelMultiHashMap<int, Entity>(100000, Allocator.Persistent);
-        _singletonEntity = state.EntityManager.CreateEntity();
-        state.EntityManager.AddComponentData(_singletonEntity, new ZombieSpatialMap { Map = _zombieMap });
-    }
-
-    public void OnDestroy(ref SystemState state)
-    {
-        state.Dependency.Complete();
-        if (_zombieMap.IsCreated) _zombieMap.Dispose();
-    }
-
-    public void OnUpdate(ref SystemState state)
-    {
-        // [新增] 修复 Race Condition: 强制等待所有依赖此 Map 的 Job (如 ZombieMoveJob) 完成
-        // 否则 Clear() 会报错
-        state.Dependency.Complete();
-
-        _zombieMap.Clear();
-        if (MapGenerator.Instance == null) return;
-
-        SystemAPI.SetComponent(_singletonEntity, new ZombieSpatialMap { Map = _zombieMap });
-
-        var job = new PopulateHashMapJob
-        {
-            Width = MapGenerator.Instance.width,
-            MapWriter = _zombieMap.AsParallelWriter()
-        };
-        state.Dependency = job.ScheduleParallel(state.Dependency);
-    }
-
-    [BurstCompile]
-    public partial struct PopulateHashMapJob : IJobEntity
-    {
-        public int Width;
-        public NativeParallelMultiHashMap<int, Entity>.ParallelWriter MapWriter;
-
-        public void Execute(Entity entity, in LocalTransform transform, in ZombieTag tag)
-        {
-            int x = (int)math.floor(transform.Position.x);
-            int z = (int)math.floor(transform.Position.z);
-            int index = z * Width + x;
-            MapWriter.Add(index, entity);
-        }
-    }
-}
-
-// 2. 防御塔系统
+// 1. 防御塔系统
 [UpdateAfter(typeof(ZombieSpatialSystem))]
 [BurstCompile]
 public partial struct TurretSystem : ISystem
@@ -134,7 +70,6 @@ public partial struct TurretSystem : ISystem
 
             int tX = (int)math.floor(turretPos.x);
             int tZ = (int)math.floor(turretPos.z);
-
             int rangeInt = (int)math.ceil(turret.Range);
 
             for (int x = tX - rangeInt; x <= tX + rangeInt; x++)
@@ -174,6 +109,7 @@ public partial struct TurretSystem : ISystem
                 float3 targetPos = ZombieTransforms[targetEntity].Position;
                 float3 dir = math.normalizesafe(targetPos - spawnPos);
 
+                // 生成子弹
                 Ecb.SetComponent(sortKey, projectile, LocalTransform.FromPosition(spawnPos));
                 Ecb.SetComponent(sortKey, projectile, new Projectile
                 {
@@ -199,11 +135,18 @@ public partial struct TurretSystem : ISystem
                 if (x0 != startX || y0 != startY)
                 {
                     if (x0 == x1 && y0 == y1) return true;
-
                     int index = y0 * MapWidth + x0;
                     if (index >= 0 && index < MapData.Length)
                     {
-                        if (MapData[index].TerrainType == 2) return false;
+                        var cell = MapData[index];
+
+                        // [核心修复 - 视线]
+                        // 1. 如果是 BuildingType != 0 (有建筑)，认为是透视的 (防御塔高，或者友军互不遮挡)
+                        // 2. 只有 BuildingType == 0 (自然地形) 且 TerrainType 为 6(山) 或 9(废墟) 才阻挡
+                        if (cell.BuildingType == 0)
+                        {
+                            if (cell.TerrainType == 6 || cell.TerrainType == 9) return false;
+                        }
                     }
                 }
                 if (x0 == x1 && y0 == y1) break;
@@ -216,7 +159,7 @@ public partial struct TurretSystem : ISystem
     }
 }
 
-// 3. 子弹系统
+// 2. 子弹系统
 [UpdateAfter(typeof(TurretSystem))]
 [BurstCompile]
 public partial struct ProjectileSystem : ISystem
@@ -293,19 +236,24 @@ public partial struct ProjectileSystem : ISystem
             int x = (int)math.floor(transform.Position.x);
             int z = (int)math.floor(transform.Position.z);
 
+            // 撞墙检测
             if (x >= 0 && x < MapWidth && z >= 0 && z < MapHeight)
             {
                 int mapIndex = z * MapWidth + x;
                 var cell = MapData[mapIndex];
-                if (cell.TerrainType == 2 && cell.BuildingType == 0)
+
+                // [核心修复 - 子弹]
+                // 只有当 BuildingType == 0 (非建筑) 且 TerrainType == 6 (真山) 时才销毁
+                // 这样子弹就可以穿过友军建筑(包括发射者自己)
+                if (cell.BuildingType == 0 && cell.TerrainType == 6)
                 {
                     Ecb.DestroyEntity(sortKey, entity);
                     return;
                 }
             }
 
+            // 撞僵尸检测
             int index = z * MapWidth + x;
-
             if (ZombieMap.TryGetFirstValue(index, out Entity zombie, out var it))
             {
                 do

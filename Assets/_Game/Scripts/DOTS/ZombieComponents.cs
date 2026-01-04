@@ -1,33 +1,35 @@
 using Unity.Entities;
 using Unity.Mathematics;
 
-// 1. 标签组件：用来标记 "这个实体是僵尸"
-// 这样我们的系统就不会去移动房子或树木
 public struct ZombieTag : IComponentData { }
 
-// 2. 速度组件：定义僵尸跑多快
 public struct MoveSpeed : IComponentData
 {
     public float Value;
 }
 
-// [新增] 只有加了这个，子弹打上去才有意义
 public struct ZombieHealth : IComponentData
 {
-    public float Value; // 当前血量
-    public float Max;   // 最大血量
-}
-// [新增] 僵尸的行为状态枚举
-public enum ZombieBehavior : byte
-{
-    Rush = 0,   // 冲锋模式（听从流场指挥，进攻基地）
-    Wander = 1  // 游荡模式（随机乱走）
+    public float Value;
+    public float Max;
 }
 
-// [新增] 状态组件
+public enum ZombieBehavior : byte
+{
+    Rush = 0,
+    Wander = 1,
+    Chase = 2,
+    Attack = 3
+}
+
 public struct ZombieState : IComponentData
 {
     public ZombieBehavior Behavior;
-    public float Timer;           // 计时器（比如每隔几秒换个方向）
-    public float3 WanderDirection; // 当前游荡的方向
+    public float Timer;            // 用于 Wander 状态的倒计时
+    public float3 WanderDirection;
+    public float3 TargetPosition;  // 追击/攻击的目标位置
+
+    // [新增] 攻击冷却计时器
+    // 0 表示准备好了，可以咬人；>0 表示正在吞咽/吼叫（冷却中）
+    public float AttackCooldown;
 }
